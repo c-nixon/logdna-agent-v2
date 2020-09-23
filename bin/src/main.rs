@@ -23,6 +23,11 @@ static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 static SLEEP_DURATION: Duration = Duration::from_millis(10);
 
+#[no_mangle]
+pub static PKG_NAME: &str = env!("CARGO_PKG_NAME");
+#[no_mangle]
+pub static PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[cfg(use_systemd)]
 fn register_journald_source(source_reader: &mut SourceReader) {
     source_reader.register(JournaldSource::new());

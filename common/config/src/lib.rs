@@ -21,6 +21,11 @@ pub mod env;
 pub mod error;
 pub mod raw;
 
+extern "Rust" {
+    static PKG_NAME: &'static str;
+    static PKG_VERSION: &'static str;
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
@@ -137,12 +142,10 @@ impl TryFrom<RawConfig> for Config {
             )
         }
 
-        template_builder.user_agent(format!(
-            "{}/{} ({})",
-            env!("CARGO_PKG_NAME"),
-            env!("CARGO_PKG_VERSION"),
-            info
-        ));
+        // Safety: this is reading from extern "Rust" statics declared in main.rs or the test module
+        let (pkg_name, pkg_version) = unsafe { (PKG_NAME, PKG_VERSION) };
+
+        template_builder.user_agent(format!("{}/{} ({})", pkg_name, pkg_version, info));
 
         let http = HttpConfig {
             template: template_builder.build()?,
@@ -217,6 +220,14 @@ pub fn get_hostname() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    // Provide values for extern symbols PKG_NAME and PKG_VERSION
+    // when building this module on it's own
+    #[no_mangle]
+    pub static PKG_NAME: &str = "test";
+    #[no_mangle]
+    pub static PKG_VERSION: &str = "test";
+
     use std::env;
     use std::fs::{remove_file, OpenOptions};
 
