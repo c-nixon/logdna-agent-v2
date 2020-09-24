@@ -1,8 +1,8 @@
-use async_trait::async_trait;
 use crate::cache::entry::Entry;
 use crate::cache::event::Event;
 use crate::cache::FileSystem;
 use crate::rule::Rules;
+use async_trait::async_trait;
 use http::types::body::LineBuilder;
 use metrics::Metrics;
 use source::Source;
@@ -27,8 +27,7 @@ impl Tailer {
         }
     }
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
-    pub async fn process(&mut self, fs: &mut FileSystem<'_, u64>) -> Option<Vec<Vec<LineBuilder>>>
-    {
+    pub async fn process(&mut self, fs: &mut FileSystem<u64>) -> Option<Vec<Vec<LineBuilder>>> {
         let events = match fs.read_events().await {
             Some(Ok(event)) => event,
             Some(Err(e)) => {
@@ -51,7 +50,9 @@ impl Tailer {
 
                     if let Entry::File { ref mut data, .. } = entry {
                         let mut len = path.metadata().map(|m| m.len()).unwrap_or(0);
-                        if len < 8192 { len = 0 }
+                        if len < 8192 {
+                            len = 0
+                        }
                         info!("initialized {:?} with offset {}", path, len,);
                         *data = len;
                     }
@@ -65,7 +66,12 @@ impl Tailer {
                         return None;
                     }
 
-                    if let Entry::File { ref mut data, file_handle, .. } = entry {
+                    if let Entry::File {
+                        ref mut data,
+                        file_handle,
+                        ..
+                    } = entry
+                    {
                         info!("added {:?}", paths[0]);
                         *data = 0;
                         if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
@@ -81,7 +87,12 @@ impl Tailer {
                         return None;
                     }
 
-                    if let Entry::File { ref mut data, file_handle, .. } = entry {
+                    if let Entry::File {
+                        ref mut data,
+                        file_handle,
+                        ..
+                    } = entry
+                    {
                         if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
                             final_lines.append(&mut lines);
                         }
@@ -103,7 +114,12 @@ impl Tailer {
                         }
                     }
 
-                    if let Entry::File { ref mut data, file_handle, .. } = entry {
+                    if let Entry::File {
+                        ref mut data,
+                        file_handle,
+                        ..
+                    } = entry
+                    {
                         if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
                             final_lines.append(&mut lines);
                         }
@@ -115,8 +131,11 @@ impl Tailer {
     }
 
     // tail a file for new line(s)
-    fn tail(file_handle: &File, paths: &[PathBuf], offset: &mut u64) -> Option<Vec<Vec<LineBuilder>>>
-    {
+    fn tail(
+        file_handle: &File,
+        paths: &[PathBuf],
+        offset: &mut u64,
+    ) -> Option<Vec<Vec<LineBuilder>>> {
         // get the file len
         let len = match file_handle.metadata().map(|m| m.len()) {
             Ok(v) => v,
@@ -184,7 +203,7 @@ impl Tailer {
                             .line(line.clone())
                             .file(path.to_str().unwrap_or("").to_string())
                     })
-                    .collect()
+                    .collect(),
             );
         }
 
@@ -204,14 +223,14 @@ impl Source for Tailer {
             None => {
                 error!("can't start filesystem source: missing watched directories");
                 return;
-            },
+            }
         };
         let rules = match self.rules.take() {
             Some(rules) => rules,
             None => {
                 error!("can't start filesystem source: missing rules");
                 return;
-            },
+            }
         };
 
         spawn(async move {

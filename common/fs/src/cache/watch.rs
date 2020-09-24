@@ -1,13 +1,8 @@
-use inotify::{EventMask, EventStream, Inotify, WatchDescriptor, WatchMask};
+use futures::{Stream, StreamExt};
+use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
-use std::collections::VecDeque;
-use std::task::Poll;
-use futures::poll;
-use futures_util::StreamExt;
-use futures_core::stream::Stream;
-use owning_ref::BoxRefMut;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WatchEvent {
@@ -41,44 +36,14 @@ pub enum WatchEvent {
     Overflow,
 }
 
-struct EventStreamWrapper<'a> {
-    event_stream: EventStream<&'a mut [u8]>
-}
-
-impl <'a> EventStreamWrapper<'a> {
-    pub fn new(inotify: &Inotify, &mut BoxRefMut<[u8]>) -> Self {
-        Self {
-            event_stream: inotify.event_stream(&mut *BoxRefMut).unwrap(),
-        }
-    }
-
-    pub fn as_ref(&self) -> &EventStream<&'a mut [u8]> {
-        &self.event_stream
-    }
-
-    pub fn as_mut(&mut self) -> &mut EventStream<&'a mut [u8]> {
-        &mut self.event_stream
-    }
-}
-
-pub struct Watcher<'a> {
+pub struct Watcher {
     inotify: Inotify,
-    buffer: BoxRefMut<[u8]>,
-    event_stream_wrapper: EventStreamWrapper<'a>,
-    events: VecDeque<WatchEvent>,
 }
 
-impl<'a> Watcher<'a> {
+impl Watcher {
     pub fn new() -> io::Result<Self> {
         let mut inotify = Inotify::init()?;
-        let mut buffer = BoxRefMut::new(Box::new([0u8; 4096]) as Box<[u8]>);
-        let event_stream_wrapper = EventStreamWrapper::new(&mut buffer);
-        Ok(Self {
-            inotify,
-            buffer,
-            event_stream_wrapper,
-            events: VecDeque::new(),
-        })
+        Ok(Self { inotify })
     }
 
     pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> io::Result<WatchDescriptor> {
@@ -90,101 +55,113 @@ impl<'a> Watcher<'a> {
         self.inotify.rm_watch(wd)
     }
 
-    pub async fn read_events(&mut self) -> Option<io::Result<Vec<WatchEvent>>> {
-        let event_stream = self.event_stream_wrapper.as_mut();
-        let (stream_min_size_hint, _) = event_stream.size_hint();
-        self.events.reserve(stream_min_size_hint);
-        let mut raw_events = Vec::with_capacity(stream_min_size_hint);
-
-        loop {
-            let poll_value = poll!(event_stream.next());
-
-            match poll_value {
-                Poll::Ready(Some(Ok(stream_item))) => raw_events.push(stream_item),
-                Poll::Ready(Some(Err(e))) => return Some(Err(e)),
-                Poll::Ready(None) => return None,
-                Poll::Pending => break,
-            }
-        }
-
-        Some(Ok(vec![WatchEvent::Overflow]))
-
-        /*
-        for raw_event in self.inotify.read_events_blocking(buffer)? {
-            if raw_event.mask.contains(EventMask::MOVED_FROM) {
-                let mut found_match = false;
-                for event in events.iter_mut() {
-                    match event {
-                        WatchEvent::MovedTo { wd, name, cookie } => {
-                            if *cookie == raw_event.cookie {
-                                *event = WatchEvent::Move {
-                                    from_wd: raw_event.wd.clone(),
-                                    from_name: raw_event.name.unwrap().to_os_string(),
-                                    to_wd: wd.clone(),
-                                    to_name: name.clone(),
-                                };
-                                found_match = true;
-                                break;
+    pub fn read_events<'a>(
+        &mut self,
+        buffer: &'a mut [u8],
+    ) -> std::io::Result<impl Stream<Item = Result<WatchEvent, std::io::Error>> + 'a> {
+        let mut unmatched_move_to = Vec::new();
+        let mut unmatched_move_from = Vec::new();
+        Ok(self
+            .inotify
+            .event_stream(buffer)?
+            .map(move |raw_event| {
+                match raw_event {
+                    Ok(raw_event) => {
+                        Ok(if raw_event.mask.contains(EventMask::MOVED_FROM) {
+                            // Check if we have seen the corresponding MOVED_TO
+                            if let Some(idx) = unmatched_move_to.iter().position(|event| {
+                                if let WatchEvent::MovedTo { wd, name, cookie } = event {
+                                    *cookie == raw_event.cookie
+                                } else {
+                                    false
+                                }
+                            }) {
+                                // If we have seen the corresponding MOVED_TO remove it
+                                // from the unmatched vec and return a Move
+                                if let WatchEvent::MovedTo { wd, name, cookie } =
+                                    unmatched_move_to.swap_remove(idx)
+                                {
+                                    Some(WatchEvent::Move {
+                                        from_wd: raw_event.wd.clone(),
+                                        from_name: raw_event.name.unwrap().to_os_string(),
+                                        to_wd: wd.clone(),
+                                        to_name: name.clone(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                // If we can't find the corresponding event, store this
+                                // event in the unmatched_move_from vec
+                                unmatched_move_from.push(WatchEvent::MovedFrom {
+                                    wd: raw_event.wd.clone(),
+                                    name: raw_event.name.unwrap().to_os_string(),
+                                    cookie: raw_event.cookie,
+                                });
+                                None
                             }
-                        }
-                        _ => continue,
-                    };
-                }
-
-                if !found_match {
-                    events.push(WatchEvent::MovedFrom {
-                        wd: raw_event.wd.clone(),
-                        name: raw_event.name.unwrap().to_os_string(),
-                        cookie: raw_event.cookie,
-                    });
-                }
-            } else if raw_event.mask.contains(EventMask::MOVED_TO) {
-                let mut found_match = false;
-                for event in events.iter_mut() {
-                    match event {
-                        WatchEvent::MovedFrom { wd, name, cookie } => {
-                            if *cookie == raw_event.cookie {
-                                *event = WatchEvent::Move {
-                                    from_wd: wd.clone(),
-                                    from_name: name.clone(),
-                                    to_wd: raw_event.wd.clone(),
-                                    to_name: raw_event.name.unwrap().to_os_string(),
-                                };
-                                found_match = true;
-                                break;
+                        } else if raw_event.mask.contains(EventMask::MOVED_TO) {
+                            if let Some(idx) = unmatched_move_from.iter().position(|event| {
+                                if let WatchEvent::MovedFrom { wd, name, cookie } = event {
+                                    *cookie == raw_event.cookie
+                                } else {
+                                    false
+                                }
+                            }) {
+                                // If we have seen the corresponding MOVED_FROM remove it
+                                // from the unmatched vec and return a Move
+                                if let WatchEvent::MovedFrom { wd, name, cookie } =
+                                    unmatched_move_from.swap_remove(idx)
+                                {
+                                    Some(WatchEvent::Move {
+                                        from_wd: wd.clone(),
+                                        from_name: name.clone(),
+                                        to_wd: raw_event.wd.clone(),
+                                        to_name: raw_event.name.unwrap().to_os_string(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            } else {
+                                // If we can't find the corresponding event, store this
+                                // event in the unmatched_move_to vec
+                                unmatched_move_to.push(WatchEvent::MovedTo {
+                                    wd: raw_event.wd.clone(),
+                                    name: raw_event.name.unwrap().to_os_string(),
+                                    cookie: raw_event.cookie,
+                                });
+                                None
                             }
-                        }
-                        _ => continue,
-                    };
+                        } else if raw_event.mask.contains(EventMask::CREATE) {
+                            Some(WatchEvent::Create {
+                                wd: raw_event.wd.clone(),
+                                name: raw_event.name.unwrap().to_os_string(),
+                            })
+                        } else if raw_event.mask.contains(EventMask::DELETE) {
+                            Some(WatchEvent::Delete {
+                                wd: raw_event.wd.clone(),
+                                name: raw_event.name.unwrap().to_os_string(),
+                            })
+                        } else if raw_event.mask.contains(EventMask::MODIFY) {
+                            Some(WatchEvent::Modify {
+                                wd: raw_event.wd.clone(),
+                            })
+                        } else if raw_event.mask.contains(EventMask::Q_OVERFLOW) {
+                            Some(WatchEvent::Overflow)
+                        } else {
+                            None
+                        })
+                    }
+                    Err(e) => Err(Some(e)),
                 }
-
-                if !found_match {
-                    events.push(WatchEvent::MovedTo {
-                        wd: raw_event.wd.clone(),
-                        name: raw_event.name.unwrap().to_os_string(),
-                        cookie: raw_event.cookie,
-                    });
+            })
+            // Unwrap the inner Option and discard unmatched events
+            .filter_map(|event| async move {
+                match event {
+                    Ok(None) => None,
+                    event => Some(event.map(|e| e.unwrap()).map_err(|e| e.unwrap())),
                 }
-            } else if raw_event.mask.contains(EventMask::CREATE) {
-                events.push(WatchEvent::Create {
-                    wd: raw_event.wd.clone(),
-                    name: raw_event.name.unwrap().to_os_string(),
-                });
-            } else if raw_event.mask.contains(EventMask::DELETE) {
-                events.push(WatchEvent::Delete {
-                    wd: raw_event.wd.clone(),
-                    name: raw_event.name.unwrap().to_os_string(),
-                });
-            } else if raw_event.mask.contains(EventMask::MODIFY) {
-                events.push(WatchEvent::Modify {
-                    wd: raw_event.wd.clone(),
-                });
-            } else if raw_event.mask.contains(EventMask::Q_OVERFLOW) {
-                events.push(WatchEvent::Overflow);
-            }
-        }
-        Ok(events)
-        */
+            }))
     }
 }
 
