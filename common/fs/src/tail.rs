@@ -1,35 +1,48 @@
+use async_trait::async_trait;
 use crate::cache::entry::Entry;
 use crate::cache::event::Event;
 use crate::cache::FileSystem;
 use crate::rule::Rules;
 use http::types::body::LineBuilder;
 use metrics::Metrics;
-use std::cell::RefCell;
+use source::Source;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::rc::Rc;
+use tokio::spawn;
+use tokio::sync::mpsc::Sender;
 
 /// Tails files on a filesystem by inheriting events from a Watcher
 pub struct Tailer {
-    // tracks the offset (bytes from the beginning of the file we have read) of file(s)
-    fs: Rc<RefCell<FileSystem<u64>>>,
+    watched_dirs: Option<Vec<PathBuf>>,
+    rules: Option<Rules>,
 }
 
 impl Tailer {
     /// Creates new instance of Tailer
     pub fn new(watched_dirs: Vec<PathBuf>, rules: Rules) -> Self {
-        let fs = FileSystem::new(watched_dirs, rules);
         Self {
-            fs: Rc::new(RefCell::new(fs)),
+            watched_dirs: Some(watched_dirs),
+            rules: Some(rules),
         }
     }
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
-    pub fn process<F>(&mut self, callback: &mut F)
-    where
-        F: FnMut(Vec<LineBuilder>),
+    pub async fn process(&mut self, fs: &mut FileSystem<'_, u64>) -> Option<Vec<Vec<LineBuilder>>>
     {
-        self.fs.clone().borrow_mut().read_events(&mut |fs, event| {
+        let events = match fs.read_events().await {
+            Some(Ok(event)) => event,
+            Some(Err(e)) => {
+                warn!("tailer stream raised exception: {:?}", e);
+                return None;
+            }
+            None => {
+                error!("tailer stream exhausted");
+                return None;
+            }
+        };
+
+        let mut final_lines = Vec::new();
+        for event in events {
             match event {
                 Event::Initialize(mut entry_ptr) => {
                     // will initiate a file to it's current length
@@ -49,13 +62,15 @@ impl Tailer {
                     let entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
                     if paths.is_empty() {
-                        return;
+                        return None;
                     }
 
                     if let Entry::File { ref mut data, file_handle, .. } = entry {
                         info!("added {:?}", paths[0]);
                         *data = 0;
-                        self.tail(file_handle, &paths, data, callback);
+                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                            final_lines.append(&mut lines);
+                        }
                     }
                 }
                 Event::Write(mut entry_ptr) => {
@@ -63,11 +78,13 @@ impl Tailer {
                     let entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
                     if paths.is_empty() {
-                        return;
+                        return None;
                     }
 
                     if let Entry::File { ref mut data, file_handle, .. } = entry {
-                        self.tail(file_handle, &paths, data, callback);
+                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                            final_lines.append(&mut lines);
+                        }
                     }
                 }
                 Event::Delete(mut entry_ptr) => {
@@ -75,7 +92,7 @@ impl Tailer {
                     let mut entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
                     if paths.is_empty() {
-                        return;
+                        return None;
                     }
 
                     if let Entry::Symlink { link, .. } = entry {
@@ -87,30 +104,31 @@ impl Tailer {
                     }
 
                     if let Entry::File { ref mut data, file_handle, .. } = entry {
-                        self.tail(file_handle, &paths, data, callback);
+                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                            final_lines.append(&mut lines);
+                        }
                     }
                 }
             };
-        });
+        }
+        Some(final_lines)
     }
 
     // tail a file for new line(s)
-    fn tail<F>(&mut self, file_handle: &File, paths: &[PathBuf], offset: &mut u64, callback: &mut F)
-    where
-        F: FnMut(Vec<LineBuilder>),
+    fn tail(file_handle: &File, paths: &[PathBuf], offset: &mut u64) -> Option<Vec<Vec<LineBuilder>>>
     {
         // get the file len
         let len = match file_handle.metadata().map(|m| m.len()) {
             Ok(v) => v,
             Err(e) => {
                 error!("unable to stat {:?}: {:?}", &paths[0], e);
-                return;
+                return None;
             }
         };
 
         // if we are at the end of the file there's no work to do
         if *offset == len {
-            return;
+            return None;
         }
         // open the file, create a reader
         let mut reader = BufReader::new(file_handle);
@@ -119,13 +137,15 @@ impl Tailer {
         if *offset > len {
             info!("{:?} was truncated from {} to {}", &paths[0], *offset, len);
             *offset = if len < 8192 { 0 } else { len };
-            return;
+            return None;
         }
         // seek to the offset, this creates the "tailing" effect
         if let Err(e) = reader.seek(SeekFrom::Start(*offset)) {
             error!("error seeking {:?}", e);
-            return;
+            return None;
         }
+
+        let mut line_groups = Vec::new();
 
         loop {
             let mut raw_line = Vec::new();
@@ -134,7 +154,7 @@ impl Tailer {
                 Ok(v) => v as u64,
                 Err(e) => {
                     error!("error reading from file {:?}: {:?}", &paths[0], e);
-                    return;
+                    break;
                 }
             };
             // try to parse the raw data as utf8
@@ -146,7 +166,7 @@ impl Tailer {
             // so we return in this case
             if !line.ends_with('\n') {
                 Metrics::fs().increment_partial_reads();
-                return;
+                break;
             }
             // remove the trailing new line
             line.pop();
@@ -154,7 +174,7 @@ impl Tailer {
             *offset += line_len;
             // send the line upstream, safe to unwrap
             debug!("tailer sendings lines for {:?}", paths);
-            callback(
+            line_groups.push(
                 paths
                     .iter()
                     .map(|path| {
@@ -164,8 +184,38 @@ impl Tailer {
                             .line(line.clone())
                             .file(path.to_str().unwrap_or("").to_string())
                     })
-                    .collect(),
+                    .collect()
             );
         }
+
+        if line_groups.len() == 0 {
+            None
+        } else {
+            Some(line_groups)
+        }
+    }
+}
+
+#[async_trait]
+impl Source for Tailer {
+    async fn begin_processing(&mut self, sender: Sender<Vec<LineBuilder>>) {
+        let watched_dirs = match self.watched_dirs.take() {
+            Some(watched_dirs) => watched_dirs,
+            None => {
+                error!("can't start filesystem source: missing watched directories");
+                return;
+            },
+        };
+        let rules = match self.rules.take() {
+            Some(rules) => rules,
+            None => {
+                error!("can't start filesystem source: missing rules");
+                return;
+            },
+        };
+
+        spawn(async move {
+            let fs = FileSystem::<u64>::new(watched_dirs, rules);
+        });
     }
 }

@@ -5,6 +5,7 @@ extern crate quick_error;
 #[allow(unused_imports)]
 #[macro_use]
 extern crate lazy_static;
+extern crate owning_ref;
 
 /// Prototype
 pub mod cache;
@@ -12,7 +13,5 @@ pub mod cache;
 pub mod error;
 /// Traits and types for defining exclusion and inclusion rules
 pub mod rule;
-/// The source for filesystem generated lines
-pub mod source;
 /// Defines the tailer used to tail directories or single files
 pub mod tail;

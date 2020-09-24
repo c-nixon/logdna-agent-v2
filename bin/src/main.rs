@@ -4,19 +4,20 @@ extern crate log;
 use std::path::PathBuf;
 use std::thread::spawn;
 
+use async_trait::async_trait;
 use config::Config;
-use fs::source::FSSource;
 use http::client::Client;
 #[cfg(use_systemd)]
 use journald::source::JournaldSource;
 use k8s::middleware::K8sMetadata;
 use metrics::Metrics;
 use middleware::Executor;
-use source::SourceReader;
+use source::{SourceCollection, Source};
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::thread::sleep;
-use std::time::Duration;
+use http::types::body::LineBuilder;
+use tokio::sync::mpsc::Sender;
+use fs::tail::Tailer;
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -32,6 +33,7 @@ pub static PKG_NAME: &str = env!("CARGO_PKG_NAME");
 #[no_mangle]
 pub static PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/*
 #[cfg(use_systemd)]
 fn register_journald_source(source_reader: &mut SourceReader) {
     source_reader.register(JournaldSource::new());
@@ -39,8 +41,23 @@ fn register_journald_source(source_reader: &mut SourceReader) {
 
 #[cfg(not(use_systemd))]
 fn register_journald_source(_source_reader: &mut SourceReader) {}
+*/
 
-fn main() {
+enum AgentSources {
+    Tailer(Tailer),
+}
+
+#[async_trait]
+impl Source for AgentSources {
+    async fn begin_processing(&mut self, sender: Sender<Vec<LineBuilder>>) {
+        match self {
+            AgentSources::Tailer(tailer) => tailer.begin_processing(sender),
+        };
+    }
+}
+
+#[tokio::main]
+async fn main() {
     env_logger::init();
     info!("running version: {}", env!("CARGO_PKG_VERSION"));
 
@@ -68,12 +85,12 @@ fn main() {
         };
     }
 
-    let mut source_reader = SourceReader::new();
-    register_journald_source(&mut source_reader);
-    source_reader.register(FSSource::new(config.log.dirs, config.log.rules));
+    let mut source_collection = SourceCollection::<AgentSources>::new();
+    source_collection.register(AgentSources::Tailer(Tailer::new(config.log.dirs, config.log.rules))).await;
 
     executor.init();
 
+    /*
     loop {
         source_reader.drain(Box::new(|lines| {
             if let Some(lines) = executor.process(lines) {
@@ -85,4 +102,5 @@ fn main() {
         client.borrow_mut().poll();
         sleep(SLEEP_DURATION);
     }
+    */
 }

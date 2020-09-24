@@ -22,6 +22,12 @@ hashbrown = "0.8"
 log = "0.4"
 env_logger = "0.7"
 lazy_static = "1.4"
+tokio = { version = "0.2", features = ["full"] }
+futures = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+owning_ref = "0.4"
 
 [dev-dependencies]
 tempfile = "3.1"
