@@ -2,18 +2,19 @@ use crate::cache::entry::{Entry, EntryPtr};
 use crate::cache::event::Event;
 use crate::cache::watch::{WatchEvent, Watcher};
 use crate::rule::{GlobRule, Rules, Status};
+use futures::{FutureExt, StreamExt};
 use hashbrown::hash_map::Entry as HashMapEntry;
 use hashbrown::HashMap;
 use inotify::WatchDescriptor;
 use metrics::Metrics;
 use std::ffi::OsString;
-use std::{fmt, io};
 use std::fs::read_dir;
 use std::fs::OpenOptions;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, PathBuf};
 use std::ptr::NonNull;
+use std::{fmt, io};
 
 pub mod entry;
 pub mod event;
@@ -23,8 +24,11 @@ type Children<T> = HashMap<OsString, Box<Entry<T>>>;
 type Symlinks<T> = HashMap<PathBuf, Vec<EntryPtr<T>>>;
 type WatchDescriptors<T> = HashMap<WatchDescriptor, Vec<EntryPtr<T>>>;
 
-pub struct FileSystem<'a, T> {
-    watcher: Watcher<'a>,
+pub struct FileSystem<T>
+where
+    T: Clone,
+{
+    watcher: Watcher,
     root: Box<Entry<T>>,
 
     symlinks: Symlinks<T>,
@@ -36,7 +40,10 @@ pub struct FileSystem<'a, T> {
     initial_events: Vec<Event<T>>,
 }
 
-impl<'a, T: Default> FileSystem<'a, T> {
+impl<'a, T: Default> FileSystem<T>
+where
+    T: Clone,
+{
     pub fn new(inital_dirs: Vec<PathBuf>, rules: Rules) -> Self {
         let mut watcher = Watcher::new().expect("unable to initialize inotify");
 
@@ -84,7 +91,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
                         Event::New(entry) => fs.initial_events.push(Event::Initialize(entry)),
                         _ => panic!("unexpected event in initialization"),
                     };
-                };
+                }
             }
         }
 
@@ -92,36 +99,45 @@ impl<'a, T: Default> FileSystem<'a, T> {
     }
 
     pub async fn read_events(&mut self) -> Option<io::Result<Vec<Event<T>>>> {
-        let mut events = Vec::new();
+        let mut acc = Vec::new();
         if !self.initial_events.is_empty() {
             for event in std::mem::replace(&mut self.initial_events, Vec::new()) {
-                events.push(event)
+                acc.push(event)
             }
         }
 
-        let watch_events = match self.watcher.read_events().await {
-            Some(Ok(events)) => events,
-            Some(Err(e)) => {
-                return Some(Err(e));
-            },
-            None => {
+        let mut buf = [0u8; 4096];
+        let events = match self.watcher.read_events(&mut buf) {
+            Ok(events) => events,
+            Err(e) => {
+                error!("error reading from watcher: {}", e);
                 return None;
-            },
+            }
         };
 
-        for watch_event in watch_events {
-            self.process(watch_event, &mut events);
-        }
-
-        Some(Ok(events))
+        let self_handle = std::sync::Arc::new(tokio::sync::Mutex::new(self));
+        let acc_handle = std::sync::Arc::new(tokio::sync::Mutex::new(acc));
+        events
+            .for_each(|event| {
+                let self_handle = self_handle.clone();
+                let acc_handle = acc_handle.clone();
+                async move {
+                    match event {
+                        Ok(event) => self_handle
+                            .lock()
+                            .await
+                            .process(event, &mut *(acc_handle.lock().await)),
+                        _ => panic!("What's the deal if inotify errors?"),
+                    }
+                }
+            })
+            .await;
+        let ret = acc_handle.lock().await.clone();
+        Some(Ok(ret))
     }
 
     // handles inotify events and may produce Event(s) that are return upstream through sender
-    fn process(
-        &mut self,
-        watch_event: WatchEvent,
-        events: &mut Vec<Event<T>>
-    ) {
+    fn process(&mut self, watch_event: WatchEvent, events: &mut Vec<Event<T>>) {
         Metrics::fs().increment_events();
 
         debug!("handling inotify event {:#?}", watch_event);
@@ -203,7 +219,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
         &mut self,
         watch_descriptor: &WatchDescriptor,
         name: OsString,
-        events: &mut Vec<Event<T>>
+        events: &mut Vec<Event<T>>,
     ) {
         // directories can't be a hard link so we're guaranteed the watch descriptor maps to one
         // entry
@@ -231,16 +247,9 @@ impl<'a, T: Default> FileSystem<'a, T> {
         }
     }
 
-    fn process_modify(
-        &mut self,
-        watch_descriptor: &WatchDescriptor,
-        events: &mut Vec<Event<T>>
-    ) {
+    fn process_modify(&mut self, watch_descriptor: &WatchDescriptor, events: &mut Vec<Event<T>>) {
         let mut entry_ptrs_opt = None;
-        if let Some(entries) = self
-            .watch_descriptors
-            .get_mut(watch_descriptor)
-        {
+        if let Some(entries) = self.watch_descriptors.get_mut(watch_descriptor) {
             entry_ptrs_opt = Some(entries.clone())
         }
 
@@ -380,11 +389,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
         }
     }
 
-    fn insert(
-        &mut self,
-        path: &PathBuf,
-        events: &mut Vec<Event<T>>,
-    ) -> Option<EntryPtr<T>> {
+    fn insert(&mut self, path: &PathBuf, events: &mut Vec<Event<T>>) -> Option<EntryPtr<T>> {
         if !self.passes(path.to_str().unwrap()) {
             info!("ignoring {:?}", path);
             return None;
@@ -524,11 +529,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
         info!("unwatching {:?}", path);
     }
 
-    fn remove(
-        &mut self,
-        path: &PathBuf,
-        events: &mut Vec<Event<T>>,
-    ) -> Option<Box<Entry<T>>> {
+    fn remove(&mut self, path: &PathBuf, events: &mut Vec<Event<T>>) -> Option<Box<Entry<T>>> {
         let mut parent = self.lookup(&path.parent()?.into())?;
         let component = into_components(path).pop()?;
 
@@ -545,11 +546,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
         }
     }
 
-    fn drop_entry(
-        &mut self,
-        entry_ptr: EntryPtr<T>,
-        events: &mut Vec<Event<T>>,
-    ) {
+    fn drop_entry(&mut self, entry_ptr: EntryPtr<T>, events: &mut Vec<Event<T>>) {
         self.unregister(entry_ptr);
         let entry = unsafe { entry_ptr.as_ref() };
         match entry {
@@ -794,7 +791,7 @@ impl<'a, T: Default> FileSystem<'a, T> {
 }
 
 // conditionally implement std::fmt::Debug if the underlying type T implements it
-impl<T: fmt::Debug> fmt::Debug for FileSystem<'_, T> {
+impl<T: fmt::Debug + Clone> fmt::Debug for FileSystem<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut builder = f.debug_struct("FileSystem");
         builder.field("root", &&self.root);
