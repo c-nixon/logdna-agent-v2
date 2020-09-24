@@ -84,7 +84,7 @@ lint-format: ## Checks for formatting errors
 
 .PHONY:lint-clippy
 lint-clippy: ## Checks for code errors
-	$(RUST_COMMAND) "cargo clippy --all-targets -- -D warnings"
+	$(RUST_COMMAND) "cargo clippy -- -D warnings"
 
 .PHONY:lint-audit
 lint-audit: ## Audits packages for issues

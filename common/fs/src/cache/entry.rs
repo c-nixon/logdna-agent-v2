@@ -97,3 +97,5 @@ impl<T> Entry<T> {
         }
     }
 }
+
+unsafe impl<T> Send for Entry<T> {}

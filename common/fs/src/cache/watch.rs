@@ -1,7 +1,13 @@
-use inotify::{EventMask, Inotify, WatchDescriptor, WatchMask};
+use inotify::{EventMask, EventStream, Inotify, WatchDescriptor, WatchMask};
 use std::ffi::OsString;
 use std::io;
 use std::path::Path;
+use std::collections::VecDeque;
+use std::task::Poll;
+use futures::poll;
+use futures_util::StreamExt;
+use futures_core::stream::Stream;
+use owning_ref::BoxRefMut;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WatchEvent {
@@ -35,14 +41,43 @@ pub enum WatchEvent {
     Overflow,
 }
 
-pub struct Watcher {
-    inotify: Inotify,
+struct EventStreamWrapper<'a> {
+    event_stream: EventStream<&'a mut [u8]>
 }
 
-impl Watcher {
+impl <'a> EventStreamWrapper<'a> {
+    pub fn new(inotify: &Inotify, &mut BoxRefMut<[u8]>) -> Self {
+        Self {
+            event_stream: inotify.event_stream(&mut *BoxRefMut).unwrap(),
+        }
+    }
+
+    pub fn as_ref(&self) -> &EventStream<&'a mut [u8]> {
+        &self.event_stream
+    }
+
+    pub fn as_mut(&mut self) -> &mut EventStream<&'a mut [u8]> {
+        &mut self.event_stream
+    }
+}
+
+pub struct Watcher<'a> {
+    inotify: Inotify,
+    buffer: BoxRefMut<[u8]>,
+    event_stream_wrapper: EventStreamWrapper<'a>,
+    events: VecDeque<WatchEvent>,
+}
+
+impl<'a> Watcher<'a> {
     pub fn new() -> io::Result<Self> {
+        let mut inotify = Inotify::init()?;
+        let mut buffer = BoxRefMut::new(Box::new([0u8; 4096]) as Box<[u8]>);
+        let event_stream_wrapper = EventStreamWrapper::new(&mut buffer);
         Ok(Self {
-            inotify: Inotify::init()?,
+            inotify,
+            buffer,
+            event_stream_wrapper,
+            events: VecDeque::new(),
         })
     }
 
@@ -55,9 +90,27 @@ impl Watcher {
         self.inotify.rm_watch(wd)
     }
 
-    pub fn read_events(&mut self, buffer: &mut [u8]) -> io::Result<Vec<WatchEvent>> {
-        let mut events = Vec::new();
-        for raw_event in self.inotify.read_events(buffer)? {
+    pub async fn read_events(&mut self) -> Option<io::Result<Vec<WatchEvent>>> {
+        let event_stream = self.event_stream_wrapper.as_mut();
+        let (stream_min_size_hint, _) = event_stream.size_hint();
+        self.events.reserve(stream_min_size_hint);
+        let mut raw_events = Vec::with_capacity(stream_min_size_hint);
+
+        loop {
+            let poll_value = poll!(event_stream.next());
+
+            match poll_value {
+                Poll::Ready(Some(Ok(stream_item))) => raw_events.push(stream_item),
+                Poll::Ready(Some(Err(e))) => return Some(Err(e)),
+                Poll::Ready(None) => return None,
+                Poll::Pending => break,
+            }
+        }
+
+        Some(Ok(vec![WatchEvent::Overflow]))
+
+        /*
+        for raw_event in self.inotify.read_events_blocking(buffer)? {
             if raw_event.mask.contains(EventMask::MOVED_FROM) {
                 let mut found_match = false;
                 for event in events.iter_mut() {
@@ -131,6 +184,7 @@ impl Watcher {
             }
         }
         Ok(events)
+        */
     }
 }
 
