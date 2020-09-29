@@ -2,7 +2,7 @@ use crate::cache::entry::{Entry, EntryPtr};
 use crate::cache::event::Event;
 use crate::cache::watch::{WatchEvent, Watcher};
 use crate::rule::{GlobRule, Rules, Status};
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use hashbrown::hash_map::Entry as HashMapEntry;
 use hashbrown::HashMap;
 use inotify::WatchDescriptor;
@@ -40,7 +40,7 @@ where
     initial_events: Vec<Event<T>>,
 }
 
-impl<'a, T: Default> FileSystem<T>
+impl<'a, T: 'a + Default> FileSystem<T>
 where
     T: Clone,
 {
@@ -98,7 +98,7 @@ where
         fs
     }
 
-    pub async fn read_events(&mut self) -> Option<io::Result<Vec<Event<T>>>> {
+    pub async fn read_events(&'a mut self, buf: &'a mut [u8]) -> Result<impl Stream<Item = Event<T>> + 'a, std::io::Error> {
         let mut acc = Vec::new();
         if !self.initial_events.is_empty() {
             for event in std::mem::replace(&mut self.initial_events, Vec::new()) {
@@ -106,34 +106,36 @@ where
             }
         }
 
-        let mut buf = [0u8; 4096];
-        let events = match self.watcher.read_events(&mut buf) {
+        //let mut buf = [0u8; 4096];
+        let events = {match self.watcher.read_events(buf) {
             Ok(events) => events,
             Err(e) => {
                 error!("error reading from watcher: {}", e);
-                return None;
+                return Err(e);
             }
-        };
+        }};
 
-        let self_acc_handle = std::sync::Arc::new(tokio::sync::Mutex::new((self, acc)));
-        events
-            .for_each(|event| {
-                let self_acc_handle = self_acc_handle.clone();
-                async move {
+        let self_handle = std::sync::Arc::new(tokio::sync::Mutex::new(self));
 
-                    let mut guard = self_acc_handle.lock().await;
-                    let (ref mut self_handle, ref mut acc_handle) = guard.deref_mut();
+        Ok(events
+            .map(move |event| {
+                let self_handle = self_handle.clone();
+                {
+                    let mut acc = Vec::new();
+
                     match event {
-                        Ok(event) => self_handle
-                            .process(event, acc_handle),
+                        Ok(event) => {
+                            self_handle
+                                .try_lock()
+                                .expect("couldn't lock self")
+                                .process(event, &mut acc);
+                            futures::stream::iter(acc)
+                        }
                         _ => panic!("What's the deal if inotify errors?"),
                     }
                 }
             })
-            // Hangs forever waiting for the inotify stream to end...
-            .await;
-        let ret = self_acc_handle.lock().await.1.clone();
-        Some(Ok(ret))
+            .flatten())
     }
 
     // handles inotify events and may produce Event(s) that are return upstream through sender

@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use tokio::spawn;
 use tokio::sync::mpsc::Sender;
 
+use futures::{Stream, StreamExt};
+
 /// Tails files on a filesystem by inheriting events from a Watcher
 pub struct Tailer {
     watched_dirs: Option<Vec<PathBuf>>,
@@ -27,21 +29,22 @@ impl Tailer {
         }
     }
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
-    pub async fn process(&mut self, fs: &mut FileSystem<u64>) -> Option<Vec<Vec<LineBuilder>>> {
-        let events = match fs.read_events().await {
-            Some(Ok(event)) => event,
-            Some(Err(e)) => {
-                warn!("tailer stream raised exception: {:?}", e);
-                return None;
-            }
-            None => {
-                error!("tailer stream exhausted");
-                return None;
+    pub async fn process<'a>(&mut self, fs: &'a mut FileSystem<u64>, buf: &'a mut [u8]) -> Result<impl Stream<Item=Vec<LineBuilder>> + 'a, std::io::Error>{
+
+        // let mut buf = [0u8; 4096];
+        let events = {
+            match fs.read_events(buf).await {
+                Ok(event) => event,
+                Err(e) => {
+                    warn!("tailer stream raised exception: {:?}", e);
+                    return Err(e);
+                }
             }
         };
 
-        let mut final_lines = Vec::new();
-        for event in events {
+        Ok(events.map(move |event| {
+            let mut final_lines = Vec::new();
+
             match event {
                 Event::Initialize(mut entry_ptr) => {
                     // will initiate a file to it's current length
@@ -62,10 +65,7 @@ impl Tailer {
                     // similar to initiate but sets the offset to 0
                     let entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
-                    if paths.is_empty() {
-                        return None;
-                    }
-
+                    if !paths.is_empty() {
                     if let Entry::File {
                         ref mut data,
                         file_handle,
@@ -78,14 +78,15 @@ impl Tailer {
                             final_lines.append(&mut lines);
                         }
                     }
+                    }
+
+
                 }
                 Event::Write(mut entry_ptr) => {
                     Metrics::fs().increment_writes();
                     let entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
-                    if paths.is_empty() {
-                        return None;
-                    }
+                    if !paths.is_empty() {
 
                     if let Entry::File {
                         ref mut data,
@@ -96,38 +97,39 @@ impl Tailer {
                         if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
                             final_lines.append(&mut lines);
                         }
+                    }
+
                     }
                 }
                 Event::Delete(mut entry_ptr) => {
                     Metrics::fs().increment_deletes();
                     let mut entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
-                    if paths.is_empty() {
-                        return None;
-                    }
-
-                    if let Entry::Symlink { link, .. } = entry {
-                        if let Some(real_entry) = fs.lookup(link) {
-                            entry = unsafe { &mut *real_entry.as_ptr() };
-                        } else {
-                            error!("can't wrap up deleted symlink - pointed to file / directory doesn't exist: {:?}", paths[0]);
+                    if !paths.is_empty() {
+                        if let Entry::Symlink { link, .. } = entry {
+                            if let Some(real_entry) = fs.lookup(link) {
+                                entry = unsafe { &mut *real_entry.as_ptr() };
+                            } else {
+                                error!("can't wrap up deleted symlink - pointed to file / directory doesn't exist: {:?}", paths[0]);
+                            }
                         }
-                    }
 
-                    if let Entry::File {
-                        ref mut data,
-                        file_handle,
-                        ..
-                    } = entry
-                    {
-                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
-                            final_lines.append(&mut lines);
+                        if let Entry::File {
+                            ref mut data,
+                            file_handle,
+                            ..
+                        } = entry
+                        {
+                            if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                                final_lines.append(&mut lines);
+                            }
                         }
-                    }
+
+                        }
                 }
             };
-        }
-        Some(final_lines)
+            futures::stream::iter(final_lines)
+        }).flatten())
     }
 
     // tail a file for new line(s)
