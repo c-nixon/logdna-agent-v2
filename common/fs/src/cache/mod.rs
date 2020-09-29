@@ -130,6 +130,7 @@ where
                     }
                 }
             })
+            // Hangs forever waiting for the inotify stream to end...
             .await;
         let ret = self_acc_handle.lock().await.1.clone();
         Some(Ok(ret))
