@@ -889,7 +889,7 @@ mod tests {
         static ref LOGGER: () = env_logger::init();
     }
 
-    fn new_fs<T: Default>(path: PathBuf, rules: Option<Rules>) -> FileSystem<T> {
+    fn new_fs<T: Default + Clone>(path: PathBuf, rules: Option<Rules>) -> FileSystem<T> {
         let rules = rules.unwrap_or_else(|| {
             let mut rules = Rules::new();
             rules.add_inclusion(GlobRule::new(r"**").unwrap());
@@ -920,7 +920,7 @@ mod tests {
             let a = path.join("a");
             File::create(&a).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
@@ -932,7 +932,7 @@ mod tests {
             let old = path.join("a.old");
             rename(&a, &old).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_none());
@@ -946,7 +946,7 @@ mod tests {
 
             File::create(&a).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
@@ -969,7 +969,7 @@ mod tests {
             let a = path.join("a");
             File::create(&a).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
@@ -982,7 +982,7 @@ mod tests {
             copy(&a, &old).unwrap();
             remove_file(&a).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_none());
@@ -996,7 +996,7 @@ mod tests {
 
             File::create(&a).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
@@ -1016,7 +1016,7 @@ mod tests {
 
             let mut fs = new_fs::<()>(path.clone(), None);
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&path).is_some());
         });
@@ -1032,7 +1032,7 @@ mod tests {
             let mut fs = new_fs::<()>(path.clone(), None);
 
             File::create(path.join("insert.log")).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&path.join("insert.log")).is_some());
         });
@@ -1052,7 +1052,7 @@ mod tests {
             create_dir(&a).unwrap();
             symlink(&a, &b).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
@@ -1086,7 +1086,7 @@ mod tests {
             File::create(file_path.clone()).unwrap();
             hard_link(&file_path, &hard_path).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&file_path).unwrap();
             let real_watch_descriptor;
@@ -1128,7 +1128,7 @@ mod tests {
             assert!(fs.lookup(&hard_path).is_some());
 
             tempdir.close().unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&path).is_none());
             assert!(fs.lookup(&file_path).is_none());
@@ -1152,7 +1152,7 @@ mod tests {
             assert!(fs.lookup(&file_path).is_some());
 
             remove_file(&file_path).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&file_path).is_none());
         });
@@ -1173,7 +1173,7 @@ mod tests {
             let mut fs = new_fs::<()>(path, None);
 
             remove_dir_all(&b).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&a).is_some());
             assert!(fs.lookup(&b).is_none());
@@ -1195,7 +1195,7 @@ mod tests {
             let mut fs = new_fs::<()>(path, None);
 
             remove_dir_all(&a).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&a).is_none());
             assert!(fs.lookup(&b).is_some());
@@ -1220,7 +1220,7 @@ mod tests {
             assert!(fs.lookup(&b).is_some());
 
             remove_file(&b).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&a).is_some());
             assert!(fs.lookup(&b).is_none());
@@ -1243,7 +1243,7 @@ mod tests {
             let mut fs = new_fs::<()>(path, None);
 
             remove_file(&a).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&a).is_none());
             assert!(fs.lookup(&b).is_some());
@@ -1270,7 +1270,7 @@ mod tests {
             let mut fs = new_fs::<()>(path, None);
 
             rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&old_dir_path).is_none());
             assert!(fs.lookup(&file_path).is_none());
@@ -1330,7 +1330,7 @@ mod tests {
             let mut fs = new_fs::<()>(old_dir_path.clone(), None);
 
             rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             assert!(fs.lookup(&new_dir_path).is_none());
             assert!(fs.lookup(&new_dir_path.join("file.log")).is_none());
@@ -1365,7 +1365,7 @@ mod tests {
             assert!(fs.lookup(&hard_path).is_none());
 
             rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&new_dir_path);
             assert!(entry.is_some());
@@ -1414,7 +1414,7 @@ mod tests {
             File::create(file_path.clone()).unwrap();
             rename(&file_path, &new_path).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&file_path);
             assert!(entry.is_none());
@@ -1448,7 +1448,7 @@ mod tests {
 
             rename(&file_path, &move_path).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&file_path);
             assert!(entry.is_none());
@@ -1479,7 +1479,7 @@ mod tests {
             rename(&file_path, &move_path).unwrap();
             File::create(file_path.clone()).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&file_path);
             assert!(entry.is_none());
@@ -1515,7 +1515,7 @@ mod tests {
 
             rename(&file_path, &move_path).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&sym_path);
             assert!(entry.is_some());
@@ -1553,7 +1553,7 @@ mod tests {
 
             symlink(&file_path, &sym_path).unwrap();
 
-            fs.read_events(&mut |_, _| {});
+            fs.read_events();
 
             let entry = fs.lookup(&sym_path);
             assert!(entry.is_some());
