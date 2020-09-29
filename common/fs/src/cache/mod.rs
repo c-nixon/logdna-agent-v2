@@ -115,24 +115,23 @@ where
             }
         };
 
-        let self_handle = std::sync::Arc::new(tokio::sync::Mutex::new(self));
-        let acc_handle = std::sync::Arc::new(tokio::sync::Mutex::new(acc));
+        let self_acc_handle = std::sync::Arc::new(tokio::sync::Mutex::new((self, acc)));
         events
             .for_each(|event| {
-                let self_handle = self_handle.clone();
-                let acc_handle = acc_handle.clone();
+                let self_acc_handle = self_acc_handle.clone();
                 async move {
+
+                    let mut guard = self_acc_handle.lock().await;
+                    let (ref mut self_handle, ref mut acc_handle) = guard.deref_mut();
                     match event {
                         Ok(event) => self_handle
-                            .lock()
-                            .await
-                            .process(event, &mut *(acc_handle.lock().await)),
+                            .process(event, acc_handle),
                         _ => panic!("What's the deal if inotify errors?"),
                     }
                 }
             })
             .await;
-        let ret = acc_handle.lock().await.clone();
+        let ret = self_acc_handle.lock().await.1.clone();
         Some(Ok(ret))
     }
 

@@ -54,7 +54,9 @@ pub struct Watcher {
 
 impl Watcher {
     pub fn new() -> io::Result<Self> {
-        Ok(Self { inotify: Inotify::init()? })
+        Ok(Self {
+            inotify: Inotify::init()?,
+        })
     }
 
     pub fn watch<P: AsRef<Path>>(&mut self, path: P) -> io::Result<WatchDescriptor> {
@@ -239,27 +241,42 @@ impl Watcher {
                         })),
                         EventOrInterval::Interval(now) => {
                             Either::Right({
-
                                 let unmatched_move_to = unmatched_move_to.clone();
                                 let unmatched_move_from = unmatched_move_from.clone();
 
                                 {
                                     let mut events = vec![];
                                     {
-                                        let mut unmatched_move_to = unmatched_move_to.try_lock().expect("Couldn't lock unmatched_move_to");
-                                        while let Some(idx) = unmatched_move_to.iter().position(|(instant, _)| {
-                                            now - tokio::time::Duration::from_millis(INOTIFY_EVENT_GRACE_PERIOD_MS) > *instant
-                                        }){
-                                            events.push(Ok(Some(unmatched_move_to.swap_remove(idx).1)));
-                                        };
+                                        let mut unmatched_move_to = unmatched_move_to
+                                            .try_lock()
+                                            .expect("Couldn't lock unmatched_move_to");
+                                        while let Some(idx) =
+                                            unmatched_move_to.iter().position(|(instant, _)| {
+                                                now - tokio::time::Duration::from_millis(
+                                                    INOTIFY_EVENT_GRACE_PERIOD_MS,
+                                                ) > *instant
+                                            })
+                                        {
+                                            events.push(Ok(Some(
+                                                unmatched_move_to.swap_remove(idx).1,
+                                            )));
+                                        }
                                     }
                                     {
-                                        let mut unmatched_move_from = unmatched_move_from.try_lock().expect("Couldn't lock unmatched_move_to");
-                                        while let Some(idx) = unmatched_move_from.iter().position(|(instant, _)| {
-                                            now - tokio::time::Duration::from_millis(INOTIFY_EVENT_GRACE_PERIOD_MS) > *instant
-                                        }){
-                                            events.push(Ok(Some(unmatched_move_from.swap_remove(idx).1)));
-                                        };
+                                        let mut unmatched_move_from = unmatched_move_from
+                                            .try_lock()
+                                            .expect("Couldn't lock unmatched_move_to");
+                                        while let Some(idx) =
+                                            unmatched_move_from.iter().position(|(instant, _)| {
+                                                now - tokio::time::Duration::from_millis(
+                                                    INOTIFY_EVENT_GRACE_PERIOD_MS,
+                                                ) > *instant
+                                            })
+                                        {
+                                            events.push(Ok(Some(
+                                                unmatched_move_from.swap_remove(idx).1,
+                                            )));
+                                        }
                                     }
                                     // unmatched_move_to.position
                                     futures::stream::iter(events)
