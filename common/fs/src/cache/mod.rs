@@ -2,19 +2,20 @@ use crate::cache::entry::{Entry, EntryPtr};
 use crate::cache::event::Event;
 use crate::cache::watch::{WatchEvent, Watcher};
 use crate::rule::{GlobRule, Rules, Status};
-use futures::{FutureExt, Stream, StreamExt};
+use futures::{Stream, StreamExt};
 use hashbrown::hash_map::Entry as HashMapEntry;
 use hashbrown::HashMap;
 use inotify::WatchDescriptor;
 use metrics::Metrics;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs::read_dir;
 use std::fs::OpenOptions;
 use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::path::{Component, PathBuf};
 use std::ptr::NonNull;
-use std::{fmt, io};
+use std::sync::{Arc, Mutex};
 
 pub mod entry;
 pub mod event;
@@ -26,7 +27,7 @@ type WatchDescriptors<T> = HashMap<WatchDescriptor, Vec<EntryPtr<T>>>;
 
 pub struct FileSystem<T>
 where
-    T: Clone,
+    T: Clone + std::fmt::Debug,
 {
     watcher: Watcher,
     root: Box<Entry<T>>,
@@ -42,7 +43,7 @@ where
 
 impl<'a, T: 'a + Default> FileSystem<T>
 where
-    T: Clone,
+    T: Clone + std::fmt::Debug,
 {
     pub fn new(inital_dirs: Vec<PathBuf>, rules: Rules) -> Self {
         let mut watcher = Watcher::new().expect("unable to initialize inotify");
@@ -98,35 +99,55 @@ where
         fs
     }
 
-    pub async fn read_events(&'a mut self, buf: &'a mut [u8]) -> Result<impl Stream<Item = Event<T>> + 'a, std::io::Error> {
-        let mut acc = Vec::new();
-        if !self.initial_events.is_empty() {
-            for event in std::mem::replace(&mut self.initial_events, Vec::new()) {
-                acc.push(event)
-            }
-        }
-
+    pub fn read_events(
+        fs: Arc<Mutex<FileSystem<T>>>,
+        buf: &'a mut [u8],
+    ) -> Result<impl Stream<Item = Event<T>> + 'a, std::io::Error> {
         //let mut buf = [0u8; 4096];
-        let events = {match self.watcher.read_events(buf) {
-            Ok(events) => events,
-            Err(e) => {
-                error!("error reading from watcher: {}", e);
-                return Err(e);
+        println!("Creating events stream");
+        let events_stream = {
+            match fs
+                .try_lock()
+                .expect("could not lock watcher")
+                .watcher
+                .event_stream(buf)
+            {
+                Ok(events) => events,
+                Err(e) => {
+                    error!("error reading from watcher: {}", e);
+                    return Err(e);
+                }
             }
-        }};
+        };
 
-        let self_handle = std::sync::Arc::new(tokio::sync::Mutex::new(self));
+        {
+            println!(
+                "initial events: {:?}",
+                fs.try_lock()
+                    .expect("could not lock watcher")
+                    .initial_events
+            );
+        }
+        // TODO prepend these onto event stream?
+        // let mut acc = Vec::new();
+        // if !self.initial_events.is_empty() {
+        //     for event in std::mem::replace(&mut self.initial_events, Vec::new()) {
+        //         acc.push(event)
+        //     }
+        // }
 
-        Ok(events
+        println!("Mapping events stream");
+        Ok(events_stream
+            .into_stream()
             .map(move |event| {
-                let self_handle = self_handle.clone();
+                let fs = fs.clone();
                 {
+                    println!("Running fs mod closure");
                     let mut acc = Vec::new();
 
                     match event {
                         Ok(event) => {
-                            self_handle
-                                .try_lock()
+                            fs.try_lock()
                                 .expect("couldn't lock self")
                                 .process(event, &mut acc);
                             futures::stream::iter(acc)
@@ -892,7 +913,7 @@ mod tests {
         static ref LOGGER: () = env_logger::init();
     }
 
-    fn new_fs<T: Default + Clone>(path: PathBuf, rules: Option<Rules>) -> FileSystem<T> {
+    fn new_fs<T: Default + Clone + std::fmt::Debug>(path: PathBuf, rules: Option<Rules>) -> FileSystem<T> {
         let rules = rules.unwrap_or_else(|| {
             let mut rules = Rules::new();
             rules.add_inclusion(GlobRule::new(r"**").unwrap());
@@ -915,42 +936,86 @@ mod tests {
     #[test]
     fn filesystem_rotate_create_move() {
         run_test(|| {
+            use tokio::stream::{self, StreamExt};
             let tempdir = TempDir::new().unwrap();
             let path = tempdir.path().to_path_buf();
 
-            let mut fs = new_fs::<()>(path.clone(), None);
+            let fs = Arc::new(Mutex::new(new_fs::<()>(path.clone(), None)));
 
             let a = path.join("a");
             File::create(&a).unwrap();
 
-            fs.read_events();
+            let mut buf = [0u8; 4096];
 
-            let entry = fs.lookup(&a);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
+            println!("waiting for create event");
+            tokio_test::block_on(async {
+                println!(
+                    "{:?}",
+                    futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
+                        FileSystem::read_events(fs.clone(), &mut buf)
+                            .expect("failed to read events")
+                            .timeout(std::time::Duration::from_millis(100)),
+                        1
+                    ))
+                    .await
+                )
+            });
+
+            {
+                let mut fs = fs.lock().expect("failed to lock fs");
+                let entry = fs.lookup(&a);
+                assert!(entry.is_some());
+                match unsafe { entry.unwrap().as_ref() } {
+                    Entry::File { .. } => {}
+                    _ => panic!("wrong entry type"),
+                }
             }
-
             let old = path.join("a.old");
             rename(&a, &old).unwrap();
 
-            fs.read_events();
+            println!("waiting for rename event");
+            tokio_test::block_on(async {
+                println!(
+                    "{:?}",
+                         futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
+                    FileSystem::read_events(fs.clone(), &mut buf)
+                        .expect("failed to read events")
+                        .timeout(std::time::Duration::from_millis(100)),
+                    1,
+                ))
+                .await
 
-            let entry = fs.lookup(&a);
-            assert!(entry.is_none());
+                )
+                           });
 
-            let entry = fs.lookup(&old);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
+            {
+                let mut fs = fs.lock().expect("failed to lock fs");
+                let entry = fs.lookup(&a);
+                assert!(entry.is_none());
+
+                let entry = fs.lookup(&old);
+                assert!(entry.is_some());
+                match unsafe { entry.unwrap().as_ref() } {
+                    Entry::File { .. } => {}
+                    _ => panic!("wrong entry type"),
+                }
             }
-
             File::create(&a).unwrap();
+            tokio_test::block_on(async {
+                println!(
+                    "{:?}",
+                         futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
+                    FileSystem::read_events(fs.clone(), &mut buf)
+                        .expect("failed to read events")
+                        .timeout(std::time::Duration::from_millis(100)),
+                    1,
+                ))
+                .await
 
-            fs.read_events();
+                )
+            });
 
+            let mut fs = fs.lock().expect("failed to lock fs");
             let entry = fs.lookup(&a);
             assert!(entry.is_some());
             match unsafe { entry.unwrap().as_ref() } {
@@ -960,654 +1025,654 @@ mod tests {
         });
     }
 
-    // Simulates the `create_copy` log rotation strategy
-    #[test]
-    fn filesystem_rotate_create_copy() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            let a = path.join("a");
-            File::create(&a).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&a);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let old = path.join("a.old");
-            copy(&a, &old).unwrap();
-            remove_file(&a).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&a);
-            assert!(entry.is_none());
-
-            let entry = fs.lookup(&old);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            File::create(&a).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&a);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Creates a plain old dir
-    #[test]
-    fn filesystem_create_dir() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            fs.read_events();
-
-            assert!(fs.lookup(&path).is_some());
-        });
-    }
-
-    // Creates a plain old file
-    #[test]
-    fn filesystem_create_file() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            File::create(path.join("insert.log")).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&path.join("insert.log")).is_some());
-        });
-    }
-
-    // Creates a symlink
-    #[test]
-    fn filesystem_create_symlink() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            let a = path.join("a");
-            let b = path.join("b");
-            create_dir(&a).unwrap();
-            symlink(&a, &b).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&a);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Dir { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&b);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Symlink { link, .. } => {
-                    assert_eq!(*link, a);
-                }
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Creates a hardlink
-    #[test]
-    fn filesystem_create_hardlink() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            let file_path = path.join("insert.log");
-            let hard_path = path.join("hard.log");
-            File::create(file_path.clone()).unwrap();
-            hard_link(&file_path, &hard_path).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&file_path).unwrap();
-            let real_watch_descriptor;
-            match unsafe { entry.as_ref() } {
-                Entry::File { wd, .. } => {
-                    real_watch_descriptor = wd;
-                }
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&hard_path);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { wd, .. } => assert_eq!(wd, real_watch_descriptor),
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Deletes a directory
-    #[test]
-    fn filesystem_delete_filled_dir() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let file_path = path.join("file.log");
-            let sym_path = path.join("sym.log");
-            let hard_path = path.join("hard.log");
-            File::create(file_path.clone()).unwrap();
-            symlink(&file_path, &sym_path).unwrap();
-            hard_link(&file_path, &hard_path).unwrap();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            assert!(fs.lookup(&path).is_some());
-            assert!(fs.lookup(&file_path).is_some());
-            assert!(fs.lookup(&sym_path).is_some());
-            assert!(fs.lookup(&hard_path).is_some());
-
-            tempdir.close().unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&path).is_none());
-            assert!(fs.lookup(&file_path).is_none());
-            assert!(fs.lookup(&sym_path).is_none());
-            assert!(fs.lookup(&hard_path).is_none());
-        });
-    }
-
-    // Deletes a file
-    #[test]
-    fn filesystem_delete_file() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let file_path = path.join("file");
-            File::create(file_path.clone()).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            assert!(fs.lookup(&file_path).is_some());
-
-            remove_file(&file_path).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&file_path).is_none());
-        });
-    }
-
-    // Deletes a symlink
-    #[test]
-    fn filesystem_delete_symlink() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let a = path.join("a");
-            let b = path.join("b");
-            create_dir(&a).unwrap();
-            symlink(&a, &b).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            remove_dir_all(&b).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&a).is_some());
-            assert!(fs.lookup(&b).is_none());
-        });
-    }
-
-    // Deletes the pointee of a symlink
-    #[test]
-    fn filesystem_delete_symlink_pointee() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let a = path.join("a");
-            let b = path.join("b");
-            create_dir(&a).unwrap();
-            symlink(&a, &b).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            remove_dir_all(&a).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&a).is_none());
-            assert!(fs.lookup(&b).is_some());
-        });
-    }
-
-    // Deletes a hardlink
-    #[test]
-    fn filesystem_delete_hardlink() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let a = path.join("a");
-            let b = path.join("b");
-            File::create(a.clone()).unwrap();
-            hard_link(&a, &b).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            assert!(fs.lookup(&a).is_some());
-            assert!(fs.lookup(&b).is_some());
-
-            remove_file(&b).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&a).is_some());
-            assert!(fs.lookup(&b).is_none());
-        });
-    }
-
-    // Deletes the pointee of a hardlink (not totally accurate since we're not deleting the inode
-    // entry, but what evs)
-    #[test]
-    fn filesystem_delete_hardlink_pointee() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let a = path.join("a");
-            let b = path.join("b");
-            File::create(a.clone()).unwrap();
-            hard_link(&a, &b).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            remove_file(&a).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&a).is_none());
-            assert!(fs.lookup(&b).is_some());
-        });
-    }
-
-    // Moves a directory within the watched directory
-    #[test]
-    fn filesystem_move_dir_internal() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let old_dir_path = path.join("old");
-            let new_dir_path = path.join("new");
-            let file_path = old_dir_path.join("file.log");
-            let sym_path = old_dir_path.join("sym.log");
-            let hard_path = old_dir_path.join("hard.log");
-            create_dir(&old_dir_path).unwrap();
-            File::create(file_path.clone()).unwrap();
-            symlink(&file_path, &sym_path).unwrap();
-            hard_link(&file_path, &hard_path).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&old_dir_path).is_none());
-            assert!(fs.lookup(&file_path).is_none());
-            assert!(fs.lookup(&sym_path).is_none());
-            assert!(fs.lookup(&hard_path).is_none());
-
-            let entry = fs.lookup(&new_dir_path);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Dir { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("file.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("hard.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("sym.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Symlink { link, .. } => {
-                    // symlinks don't update so this link is bad
-                    assert_eq!(*link, file_path);
-                }
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Moves a directory out
-    #[test]
-    fn filesystem_move_dir_out() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let old_dir_path = path.join("old");
-            let new_dir_path = path.join("new");
-            let file_path = old_dir_path.join("file.log");
-            let sym_path = old_dir_path.join("sym.log");
-            let hard_path = old_dir_path.join("hard.log");
-            create_dir(&old_dir_path).unwrap();
-            File::create(file_path.clone()).unwrap();
-            symlink(&file_path, &sym_path).unwrap();
-            hard_link(&file_path, &hard_path).unwrap();
-
-            let mut fs = new_fs::<()>(old_dir_path.clone(), None);
-
-            rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events();
-
-            assert!(fs.lookup(&new_dir_path).is_none());
-            assert!(fs.lookup(&new_dir_path.join("file.log")).is_none());
-            assert!(fs.lookup(&new_dir_path.join("hard.log")).is_none());
-            assert!(fs.lookup(&new_dir_path.join("sym.log")).is_none());
-        });
-    }
-
-    // Moves a directory in
-    #[test]
-    fn filesystem_move_dir_in() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let old_dir_path = path.join("old");
-            let new_dir_path = path.join("new");
-            let file_path = old_dir_path.join("file.log");
-            let sym_path = old_dir_path.join("sym.log");
-            let hard_path = old_dir_path.join("hard.log");
-            create_dir(&old_dir_path).unwrap();
-            File::create(file_path.clone()).unwrap();
-            symlink(&file_path, &sym_path).unwrap();
-            hard_link(&file_path, &hard_path).unwrap();
-
-            let mut fs = new_fs::<()>(new_dir_path.clone(), None);
-
-            assert!(fs.lookup(&old_dir_path).is_none());
-            assert!(fs.lookup(&new_dir_path).is_none());
-            assert!(fs.lookup(&file_path).is_none());
-            assert!(fs.lookup(&sym_path).is_none());
-            assert!(fs.lookup(&hard_path).is_none());
-
-            rename(&old_dir_path, &new_dir_path).unwrap();
-            fs.read_events();
-
-            let entry = fs.lookup(&new_dir_path);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Dir { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("file.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("hard.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-
-            let entry = fs.lookup(&new_dir_path.join("sym.log"));
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::Symlink { link, .. } => {
-                    // symlinks don't update so this link is bad
-                    assert_eq!(*link, file_path);
-                }
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Moves a file within the watched directory
-    #[test]
-    fn filesystem_move_file_internal() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut fs = new_fs::<()>(path.clone(), None);
-
-            let file_path = path.join("insert.log");
-            let new_path = path.join("new.log");
-            File::create(file_path.clone()).unwrap();
-            rename(&file_path, &new_path).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_none());
-
-            let entry = fs.lookup(&new_path);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Moves a file out of the watched directory
-    #[test]
-    fn filesystem_move_file_out() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let watch_path = path.join("watch");
-            let other_path = path.join("other");
-            create_dir(&watch_path).unwrap();
-            create_dir(&other_path).unwrap();
-
-            let file_path = watch_path.join("inside.log");
-            let move_path = other_path.join("outside.log");
-            File::create(file_path.clone()).unwrap();
-
-            let mut fs = new_fs::<()>(watch_path, None);
-
-            rename(&file_path, &move_path).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_none());
-
-            let entry = fs.lookup(&move_path);
-            assert!(entry.is_none());
-        });
-    }
-
-    // Moves a file into the watched directory
-    #[test]
-    fn filesystem_move_file_in() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let watch_path = path.join("watch");
-            let other_path = path.join("other");
-            create_dir(&watch_path).unwrap();
-            create_dir(&other_path).unwrap();
-
-            let file_path = other_path.join("inside.log");
-            let move_path = watch_path.join("outside.log");
-            File::create(file_path.clone()).unwrap();
-
-            let mut fs = new_fs::<()>(watch_path, None);
-
-            rename(&file_path, &move_path).unwrap();
-            File::create(file_path.clone()).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_none());
-
-            let entry = fs.lookup(&move_path);
-            assert!(entry.is_some());
-            match unsafe { entry.unwrap().as_ref() } {
-                Entry::File { .. } => {}
-                _ => panic!("wrong entry type"),
-            }
-        });
-    }
-
-    // Moves a file out of the watched directory
-    #[test]
-    fn filesystem_move_symlink_file_out() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let watch_path = path.join("watch");
-            let other_path = path.join("other");
-            create_dir(&watch_path).unwrap();
-            create_dir(&other_path).unwrap();
-
-            let file_path = other_path.join("inside.log");
-            let move_path = other_path.join("outside.tmp");
-            let sym_path = watch_path.join("sym.log");
-            File::create(file_path.clone()).unwrap();
-            symlink(&file_path, &sym_path).unwrap();
-
-            let mut fs = new_fs::<()>(watch_path, None);
-
-            rename(&file_path, &move_path).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&sym_path);
-            assert!(entry.is_some());
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_none());
-
-            let entry = fs.lookup(&move_path);
-            assert!(entry.is_none());
-        });
-    }
-
-    // Watch symlink target that is excluded
-    #[test]
-    fn filesystem_watch_symlink_w_excluded_target() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let mut rules = Rules::new();
-            rules.add_inclusion(GlobRule::new("*.log").unwrap());
-            rules.add_inclusion(
-                GlobRule::new(&*format!("{}{}", tempdir.path().to_str().unwrap(), "*")).unwrap(),
-            );
-            rules.add_exclusion(GlobRule::new("*.tmp").unwrap());
-
-            let file_path = path.join("test.tmp");
-            let sym_path = path.join("test.log");
-            File::create(file_path.clone()).unwrap();
-
-            let mut fs = new_fs::<()>(path, Some(rules));
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_none());
-
-            symlink(&file_path, &sym_path).unwrap();
-
-            fs.read_events();
-
-            let entry = fs.lookup(&sym_path);
-            assert!(entry.is_some());
-
-            let entry = fs.lookup(&file_path);
-            assert!(entry.is_some());
-        });
-    }
-
-    #[test]
-    fn filesystem_resolve_valid_paths() {
-        run_test(|| {
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-
-            let test_dir_path = path.join("testdir");
-            let nested_dir_path = path.join("nested");
-            let local_symlink_path = path.join("local_symlink.log");
-            let remote_symlink_path = test_dir_path.join("remote_symlink.log");
-            let nested_symlink_path = nested_dir_path.join("nested_symlink.log");
-            let double_nested_symlink_path = nested_dir_path.join("double_nested_symlink.log");
-            let file_path = path.join("file.log");
-
-            File::create(file_path.clone()).unwrap();
-            create_dir(&test_dir_path).unwrap();
-            create_dir(&nested_dir_path).unwrap();
-            symlink(&file_path, &remote_symlink_path).unwrap();
-            symlink(&file_path, &local_symlink_path).unwrap();
-            symlink(&remote_symlink_path, &nested_symlink_path).unwrap();
-            symlink(&nested_symlink_path, &double_nested_symlink_path).unwrap();
-
-            let mut fs = new_fs::<()>(path, None);
-
-            let entry = unsafe { &*(fs.lookup(&file_path).unwrap()).as_ptr() };
-            let resolved_paths = fs.resolve_valid_paths(entry);
-
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == local_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == remote_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == file_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == nested_symlink_path.to_str()));
-            assert!(resolved_paths
-                .iter()
-                .any(|other| other.to_str() == double_nested_symlink_path.to_str()));
-        });
-    }
+    //     // Simulates the `create_copy` log rotation strategy
+    //     #[test]
+    //     fn filesystem_rotate_create_copy() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             let a = path.join("a");
+    //             File::create(&a).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&a);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let old = path.join("a.old");
+    //             copy(&a, &old).unwrap();
+    //             remove_file(&a).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&a);
+    //             assert!(entry.is_none());
+
+    //             let entry = fs.lookup(&old);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             File::create(&a).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&a);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Creates a plain old dir
+    //     #[test]
+    //     fn filesystem_create_dir() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&path).is_some());
+    //         });
+    //     }
+
+    //     // Creates a plain old file
+    //     #[test]
+    //     fn filesystem_create_file() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             File::create(path.join("insert.log")).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&path.join("insert.log")).is_some());
+    //         });
+    //     }
+
+    //     // Creates a symlink
+    //     #[test]
+    //     fn filesystem_create_symlink() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             let a = path.join("a");
+    //             let b = path.join("b");
+    //             create_dir(&a).unwrap();
+    //             symlink(&a, &b).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&a);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Dir { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&b);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Symlink { link, .. } => {
+    //                     assert_eq!(*link, a);
+    //                 }
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Creates a hardlink
+    //     #[test]
+    //     fn filesystem_create_hardlink() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             let file_path = path.join("insert.log");
+    //             let hard_path = path.join("hard.log");
+    //             File::create(file_path.clone()).unwrap();
+    //             hard_link(&file_path, &hard_path).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&file_path).unwrap();
+    //             let real_watch_descriptor;
+    //             match unsafe { entry.as_ref() } {
+    //                 Entry::File { wd, .. } => {
+    //                     real_watch_descriptor = wd;
+    //                 }
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&hard_path);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { wd, .. } => assert_eq!(wd, real_watch_descriptor),
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Deletes a directory
+    //     #[test]
+    //     fn filesystem_delete_filled_dir() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let file_path = path.join("file.log");
+    //             let sym_path = path.join("sym.log");
+    //             let hard_path = path.join("hard.log");
+    //             File::create(file_path.clone()).unwrap();
+    //             symlink(&file_path, &sym_path).unwrap();
+    //             hard_link(&file_path, &hard_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             assert!(fs.lookup(&path).is_some());
+    //             assert!(fs.lookup(&file_path).is_some());
+    //             assert!(fs.lookup(&sym_path).is_some());
+    //             assert!(fs.lookup(&hard_path).is_some());
+
+    //             tempdir.close().unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&path).is_none());
+    //             assert!(fs.lookup(&file_path).is_none());
+    //             assert!(fs.lookup(&sym_path).is_none());
+    //             assert!(fs.lookup(&hard_path).is_none());
+    //         });
+    //     }
+
+    //     // Deletes a file
+    //     #[test]
+    //     fn filesystem_delete_file() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let file_path = path.join("file");
+    //             File::create(file_path.clone()).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             assert!(fs.lookup(&file_path).is_some());
+
+    //             remove_file(&file_path).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&file_path).is_none());
+    //         });
+    //     }
+
+    //     // Deletes a symlink
+    //     #[test]
+    //     fn filesystem_delete_symlink() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let a = path.join("a");
+    //             let b = path.join("b");
+    //             create_dir(&a).unwrap();
+    //             symlink(&a, &b).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             remove_dir_all(&b).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&a).is_some());
+    //             assert!(fs.lookup(&b).is_none());
+    //         });
+    //     }
+
+    //     // Deletes the pointee of a symlink
+    //     #[test]
+    //     fn filesystem_delete_symlink_pointee() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let a = path.join("a");
+    //             let b = path.join("b");
+    //             create_dir(&a).unwrap();
+    //             symlink(&a, &b).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             remove_dir_all(&a).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&a).is_none());
+    //             assert!(fs.lookup(&b).is_some());
+    //         });
+    //     }
+
+    //     // Deletes a hardlink
+    //     #[test]
+    //     fn filesystem_delete_hardlink() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let a = path.join("a");
+    //             let b = path.join("b");
+    //             File::create(a.clone()).unwrap();
+    //             hard_link(&a, &b).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             assert!(fs.lookup(&a).is_some());
+    //             assert!(fs.lookup(&b).is_some());
+
+    //             remove_file(&b).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&a).is_some());
+    //             assert!(fs.lookup(&b).is_none());
+    //         });
+    //     }
+
+    //     // Deletes the pointee of a hardlink (not totally accurate since we're not deleting the inode
+    //     // entry, but what evs)
+    //     #[test]
+    //     fn filesystem_delete_hardlink_pointee() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let a = path.join("a");
+    //             let b = path.join("b");
+    //             File::create(a.clone()).unwrap();
+    //             hard_link(&a, &b).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             remove_file(&a).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&a).is_none());
+    //             assert!(fs.lookup(&b).is_some());
+    //         });
+    //     }
+
+    //     // Moves a directory within the watched directory
+    //     #[test]
+    //     fn filesystem_move_dir_internal() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let old_dir_path = path.join("old");
+    //             let new_dir_path = path.join("new");
+    //             let file_path = old_dir_path.join("file.log");
+    //             let sym_path = old_dir_path.join("sym.log");
+    //             let hard_path = old_dir_path.join("hard.log");
+    //             create_dir(&old_dir_path).unwrap();
+    //             File::create(file_path.clone()).unwrap();
+    //             symlink(&file_path, &sym_path).unwrap();
+    //             hard_link(&file_path, &hard_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             rename(&old_dir_path, &new_dir_path).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&old_dir_path).is_none());
+    //             assert!(fs.lookup(&file_path).is_none());
+    //             assert!(fs.lookup(&sym_path).is_none());
+    //             assert!(fs.lookup(&hard_path).is_none());
+
+    //             let entry = fs.lookup(&new_dir_path);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Dir { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("file.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("hard.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("sym.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Symlink { link, .. } => {
+    //                     // symlinks don't update so this link is bad
+    //                     assert_eq!(*link, file_path);
+    //                 }
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Moves a directory out
+    //     #[test]
+    //     fn filesystem_move_dir_out() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let old_dir_path = path.join("old");
+    //             let new_dir_path = path.join("new");
+    //             let file_path = old_dir_path.join("file.log");
+    //             let sym_path = old_dir_path.join("sym.log");
+    //             let hard_path = old_dir_path.join("hard.log");
+    //             create_dir(&old_dir_path).unwrap();
+    //             File::create(file_path.clone()).unwrap();
+    //             symlink(&file_path, &sym_path).unwrap();
+    //             hard_link(&file_path, &hard_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(old_dir_path.clone(), None);
+
+    //             rename(&old_dir_path, &new_dir_path).unwrap();
+    //             fs.read_events();
+
+    //             assert!(fs.lookup(&new_dir_path).is_none());
+    //             assert!(fs.lookup(&new_dir_path.join("file.log")).is_none());
+    //             assert!(fs.lookup(&new_dir_path.join("hard.log")).is_none());
+    //             assert!(fs.lookup(&new_dir_path.join("sym.log")).is_none());
+    //         });
+    //     }
+
+    //     // Moves a directory in
+    //     #[test]
+    //     fn filesystem_move_dir_in() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let old_dir_path = path.join("old");
+    //             let new_dir_path = path.join("new");
+    //             let file_path = old_dir_path.join("file.log");
+    //             let sym_path = old_dir_path.join("sym.log");
+    //             let hard_path = old_dir_path.join("hard.log");
+    //             create_dir(&old_dir_path).unwrap();
+    //             File::create(file_path.clone()).unwrap();
+    //             symlink(&file_path, &sym_path).unwrap();
+    //             hard_link(&file_path, &hard_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(new_dir_path.clone(), None);
+
+    //             assert!(fs.lookup(&old_dir_path).is_none());
+    //             assert!(fs.lookup(&new_dir_path).is_none());
+    //             assert!(fs.lookup(&file_path).is_none());
+    //             assert!(fs.lookup(&sym_path).is_none());
+    //             assert!(fs.lookup(&hard_path).is_none());
+
+    //             rename(&old_dir_path, &new_dir_path).unwrap();
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&new_dir_path);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Dir { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("file.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("hard.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+
+    //             let entry = fs.lookup(&new_dir_path.join("sym.log"));
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::Symlink { link, .. } => {
+    //                     // symlinks don't update so this link is bad
+    //                     assert_eq!(*link, file_path);
+    //                 }
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Moves a file within the watched directory
+    //     #[test]
+    //     fn filesystem_move_file_internal() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut fs = new_fs::<()>(path.clone(), None);
+
+    //             let file_path = path.join("insert.log");
+    //             let new_path = path.join("new.log");
+    //             File::create(file_path.clone()).unwrap();
+    //             rename(&file_path, &new_path).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_none());
+
+    //             let entry = fs.lookup(&new_path);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Moves a file out of the watched directory
+    //     #[test]
+    //     fn filesystem_move_file_out() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let watch_path = path.join("watch");
+    //             let other_path = path.join("other");
+    //             create_dir(&watch_path).unwrap();
+    //             create_dir(&other_path).unwrap();
+
+    //             let file_path = watch_path.join("inside.log");
+    //             let move_path = other_path.join("outside.log");
+    //             File::create(file_path.clone()).unwrap();
+
+    //             let mut fs = new_fs::<()>(watch_path, None);
+
+    //             rename(&file_path, &move_path).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_none());
+
+    //             let entry = fs.lookup(&move_path);
+    //             assert!(entry.is_none());
+    //         });
+    //     }
+
+    //     // Moves a file into the watched directory
+    //     #[test]
+    //     fn filesystem_move_file_in() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let watch_path = path.join("watch");
+    //             let other_path = path.join("other");
+    //             create_dir(&watch_path).unwrap();
+    //             create_dir(&other_path).unwrap();
+
+    //             let file_path = other_path.join("inside.log");
+    //             let move_path = watch_path.join("outside.log");
+    //             File::create(file_path.clone()).unwrap();
+
+    //             let mut fs = new_fs::<()>(watch_path, None);
+
+    //             rename(&file_path, &move_path).unwrap();
+    //             File::create(file_path.clone()).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_none());
+
+    //             let entry = fs.lookup(&move_path);
+    //             assert!(entry.is_some());
+    //             match unsafe { entry.unwrap().as_ref() } {
+    //                 Entry::File { .. } => {}
+    //                 _ => panic!("wrong entry type"),
+    //             }
+    //         });
+    //     }
+
+    //     // Moves a file out of the watched directory
+    //     #[test]
+    //     fn filesystem_move_symlink_file_out() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let watch_path = path.join("watch");
+    //             let other_path = path.join("other");
+    //             create_dir(&watch_path).unwrap();
+    //             create_dir(&other_path).unwrap();
+
+    //             let file_path = other_path.join("inside.log");
+    //             let move_path = other_path.join("outside.tmp");
+    //             let sym_path = watch_path.join("sym.log");
+    //             File::create(file_path.clone()).unwrap();
+    //             symlink(&file_path, &sym_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(watch_path, None);
+
+    //             rename(&file_path, &move_path).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&sym_path);
+    //             assert!(entry.is_some());
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_none());
+
+    //             let entry = fs.lookup(&move_path);
+    //             assert!(entry.is_none());
+    //         });
+    //     }
+
+    //     // Watch symlink target that is excluded
+    //     #[test]
+    //     fn filesystem_watch_symlink_w_excluded_target() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let mut rules = Rules::new();
+    //             rules.add_inclusion(GlobRule::new("*.log").unwrap());
+    //             rules.add_inclusion(
+    //                 GlobRule::new(&*format!("{}{}", tempdir.path().to_str().unwrap(), "*")).unwrap(),
+    //             );
+    //             rules.add_exclusion(GlobRule::new("*.tmp").unwrap());
+
+    //             let file_path = path.join("test.tmp");
+    //             let sym_path = path.join("test.log");
+    //             File::create(file_path.clone()).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, Some(rules));
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_none());
+
+    //             symlink(&file_path, &sym_path).unwrap();
+
+    //             fs.read_events();
+
+    //             let entry = fs.lookup(&sym_path);
+    //             assert!(entry.is_some());
+
+    //             let entry = fs.lookup(&file_path);
+    //             assert!(entry.is_some());
+    //         });
+    //     }
+
+    //     #[test]
+    //     fn filesystem_resolve_valid_paths() {
+    //         run_test(|| {
+    //             let tempdir = TempDir::new().unwrap();
+    //             let path = tempdir.path().to_path_buf();
+
+    //             let test_dir_path = path.join("testdir");
+    //             let nested_dir_path = path.join("nested");
+    //             let local_symlink_path = path.join("local_symlink.log");
+    //             let remote_symlink_path = test_dir_path.join("remote_symlink.log");
+    //             let nested_symlink_path = nested_dir_path.join("nested_symlink.log");
+    //             let double_nested_symlink_path = nested_dir_path.join("double_nested_symlink.log");
+    //             let file_path = path.join("file.log");
+
+    //             File::create(file_path.clone()).unwrap();
+    //             create_dir(&test_dir_path).unwrap();
+    //             create_dir(&nested_dir_path).unwrap();
+    //             symlink(&file_path, &remote_symlink_path).unwrap();
+    //             symlink(&file_path, &local_symlink_path).unwrap();
+    //             symlink(&remote_symlink_path, &nested_symlink_path).unwrap();
+    //             symlink(&nested_symlink_path, &double_nested_symlink_path).unwrap();
+
+    //             let mut fs = new_fs::<()>(path, None);
+
+    //             let entry = unsafe { &*(fs.lookup(&file_path).unwrap()).as_ptr() };
+    //             let resolved_paths = fs.resolve_valid_paths(entry);
+
+    //             assert!(resolved_paths
+    //                 .iter()
+    //                 .any(|other| other.to_str() == local_symlink_path.to_str()));
+    //             assert!(resolved_paths
+    //                 .iter()
+    //                 .any(|other| other.to_str() == remote_symlink_path.to_str()));
+    //             assert!(resolved_paths
+    //                 .iter()
+    //                 .any(|other| other.to_str() == file_path.to_str()));
+    //             assert!(resolved_paths
+    //                 .iter()
+    //                 .any(|other| other.to_str() == nested_symlink_path.to_str()));
+    //             assert!(resolved_paths
+    //                 .iter()
+    //                 .any(|other| other.to_str() == double_nested_symlink_path.to_str()));
+    //         });
+    //     }
 }

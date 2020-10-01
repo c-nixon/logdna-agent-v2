@@ -9,6 +9,7 @@ use source::Source;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tokio::spawn;
 use tokio::sync::mpsc::Sender;
 
@@ -29,11 +30,14 @@ impl Tailer {
         }
     }
     /// Runs the main logic of the tailer, this can only be run once so Tailer is consumed
-    pub async fn process<'a>(&mut self, fs: &'a mut FileSystem<u64>, buf: &'a mut [u8]) -> Result<impl Stream<Item=Vec<LineBuilder>> + 'a, std::io::Error>{
-
+    pub async fn process<'a>(
+        &mut self,
+        fs: Arc<Mutex<FileSystem<u64>>>,
+        buf: &'a mut [u8],
+    ) -> Result<impl Stream<Item = Vec<LineBuilder>> + 'a, std::io::Error> {
         // let mut buf = [0u8; 4096];
         let events = {
-            match fs.read_events(buf).await {
+            match FileSystem::read_events(fs.clone(), buf) {
                 Ok(event) => event,
                 Err(e) => {
                     warn!("tailer stream raised exception: {:?}", e);
@@ -42,9 +46,12 @@ impl Tailer {
             }
         };
 
-        Ok(events.map(move |event| {
+        Ok(events.map({
+            let fs = fs.clone();
+            move |event| {
             let mut final_lines = Vec::new();
 
+            let mut fs = fs.lock().expect("Couldn't lock fs");
             match event {
                 Event::Initialize(mut entry_ptr) => {
                     // will initiate a file to it's current length
@@ -66,18 +73,18 @@ impl Tailer {
                     let entry = unsafe { entry_ptr.as_mut() };
                     let paths = fs.resolve_valid_paths(entry);
                     if !paths.is_empty() {
-                    if let Entry::File {
-                        ref mut data,
-                        file_handle,
-                        ..
-                    } = entry
-                    {
-                        info!("added {:?}", paths[0]);
-                        *data = 0;
-                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
-                            final_lines.append(&mut lines);
+                        if let Entry::File {
+                            ref mut data,
+                            file_handle,
+                            ..
+                        } = entry
+                        {
+                            info!("added {:?}", paths[0]);
+                            *data = 0;
+                            if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                                final_lines.append(&mut lines);
+                            }
                         }
-                    }
                     }
 
 
@@ -88,16 +95,16 @@ impl Tailer {
                     let paths = fs.resolve_valid_paths(entry);
                     if !paths.is_empty() {
 
-                    if let Entry::File {
-                        ref mut data,
-                        file_handle,
-                        ..
-                    } = entry
-                    {
-                        if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
-                            final_lines.append(&mut lines);
+                        if let Entry::File {
+                            ref mut data,
+                            file_handle,
+                            ..
+                        } = entry
+                        {
+                            if let Some(mut lines) = Tailer::tail(file_handle, &paths, data) {
+                                final_lines.append(&mut lines);
+                            }
                         }
-                    }
 
                     }
                 }
@@ -125,11 +132,11 @@ impl Tailer {
                             }
                         }
 
-                        }
+                    }
                 }
             };
             futures::stream::iter(final_lines)
-        }).flatten())
+        }}).flatten())
     }
 
     // tail a file for new line(s)

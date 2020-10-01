@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use http::types::body::LineBuilder;
-use tokio::sync::mpsc::{Sender, Receiver, channel};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 #[async_trait]
 pub trait Source {

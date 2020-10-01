@@ -68,10 +68,22 @@ impl Watcher {
         self.inotify.rm_watch(wd)
     }
 
-    pub fn read_events<'a>(
+    pub fn event_stream<'a>(
         &mut self,
         buffer: &'a mut [u8],
-    ) -> std::io::Result<impl Stream<Item = Result<WatchEvent, std::io::Error>> + 'a> {
+    ) -> std::io::Result<WatchEventStream<'a>> {
+        Ok(WatchEventStream {
+            event_stream: self.inotify.event_stream(buffer)?,
+        })
+    }
+}
+
+pub struct WatchEventStream<'a> {
+    event_stream: inotify::EventStream<&'a mut [u8]>,
+}
+
+impl<'a> WatchEventStream<'a> {
+    pub fn into_stream(self) -> impl Stream<Item = Result<WatchEvent, std::io::Error>> + 'a {
         let unmatched_move_to: Arc<Mutex<Vec<(Instant, WatchEvent)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let unmatched_move_from: Arc<Mutex<Vec<(Instant, WatchEvent)>>> =
@@ -79,17 +91,20 @@ impl Watcher {
         // Interleave inotify events with a heartbeat every 1 second
         // heartbeat is used to ensure unpaired MOVED_TO and MOVED_FROM
         // correctly generate events.
+
+        println!("Creating time and inotify streams");
         let events = futures::stream::select(
-            self.inotify
-                .event_stream(buffer)?
-                .map(EventOrInterval::Event),
+            self.event_stream.map(EventOrInterval::Event),
             tokio::time::interval(tokio::time::Duration::from_millis(
                 INOTIFY_EVENT_GRACE_PERIOD_MS,
             ))
             .map(EventOrInterval::Interval),
         );
-        Ok(events
+
+        println!("mapping over time and inotify streams");
+        events
             .map(move |raw_event_or_interval| {
+                println!("handling inotify event");
                 {
                     match raw_event_or_interval {
                         EventOrInterval::Event(raw_event) => Either::Left(futures::stream::once({
@@ -293,7 +308,7 @@ impl Watcher {
                     Ok(None) => None,
                     event => Some(event.map(|e| e.unwrap())),
                 }
-            }))
+            })
     }
 }
 

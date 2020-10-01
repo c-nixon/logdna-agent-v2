@@ -6,18 +6,19 @@ use std::thread::spawn;
 
 use async_trait::async_trait;
 use config::Config;
+use fs::tail::Tailer;
 use http::client::Client;
+use http::types::body::LineBuilder;
 #[cfg(use_systemd)]
 use journald::source::JournaldSource;
 use k8s::middleware::K8sMetadata;
 use metrics::Metrics;
 use middleware::Executor;
-use source::{SourceCollection, Source};
+use source::{Source, SourceCollection};
 use std::cell::RefCell;
 use std::rc::Rc;
-use http::types::body::LineBuilder;
+use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use fs::tail::Tailer;
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
@@ -86,7 +87,12 @@ async fn main() {
     }
 
     let mut source_collection = SourceCollection::<AgentSources>::new();
-    source_collection.register(AgentSources::Tailer(Tailer::new(config.log.dirs, config.log.rules))).await;
+    source_collection
+        .register(AgentSources::Tailer(Tailer::new(
+            config.log.dirs,
+            config.log.rules,
+        )))
+        .await;
 
     executor.init();
 
