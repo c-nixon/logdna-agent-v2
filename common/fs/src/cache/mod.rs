@@ -913,7 +913,10 @@ mod tests {
         static ref LOGGER: () = env_logger::init();
     }
 
-    fn new_fs<T: Default + Clone + std::fmt::Debug>(path: PathBuf, rules: Option<Rules>) -> FileSystem<T> {
+    fn new_fs<T: Default + Clone + std::fmt::Debug>(
+        path: PathBuf,
+        rules: Option<Rules>,
+    ) -> FileSystem<T> {
         let rules = rules.unwrap_or_else(|| {
             let mut rules = Rules::new();
             rules.add_inclusion(GlobRule::new(r"**").unwrap());
@@ -977,16 +980,15 @@ mod tests {
             tokio_test::block_on(async {
                 println!(
                     "{:?}",
-                         futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
-                    FileSystem::read_events(fs.clone(), &mut buf)
-                        .expect("failed to read events")
-                        .timeout(std::time::Duration::from_millis(100)),
-                    1,
-                ))
-                .await
-
+                    futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
+                        FileSystem::read_events(fs.clone(), &mut buf)
+                            .expect("failed to read events")
+                            .timeout(std::time::Duration::from_millis(500)),
+                        1,
+                    ))
+                    .await
                 )
-                           });
+            });
 
             {
                 let mut fs = fs.lock().expect("failed to lock fs");
@@ -1004,14 +1006,13 @@ mod tests {
             tokio_test::block_on(async {
                 println!(
                     "{:?}",
-                         futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
-                    FileSystem::read_events(fs.clone(), &mut buf)
-                        .expect("failed to read events")
-                        .timeout(std::time::Duration::from_millis(100)),
-                    1,
-                ))
-                .await
-
+                    futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
+                        FileSystem::read_events(fs.clone(), &mut buf)
+                            .expect("failed to read events")
+                            .timeout(std::time::Duration::from_millis(500)),
+                        1,
+                    ))
+                    .await
                 )
             });
 
