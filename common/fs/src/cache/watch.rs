@@ -96,7 +96,6 @@ impl<'a> WatchEventStream<'a> {
         // heartbeat is used to ensure unpaired MOVED_TO and MOVED_FROM
         // correctly generate events.
 
-        println!("Creating time and inotify streams");
         let events = futures::stream::select(
             self.event_stream.map(EventOrInterval::Event),
             tokio::time::interval(tokio::time::Duration::from_millis(
@@ -105,10 +104,8 @@ impl<'a> WatchEventStream<'a> {
             .map(EventOrInterval::Interval),
         );
 
-        println!("mapping over time and inotify streams");
         events
             .map(move |raw_event_or_interval| {
-                println!("handling inotify event: {:?}", raw_event_or_interval);
                 {
                     match raw_event_or_interval {
                         EventOrInterval::Event(raw_event) => Either::Left(futures::stream::once({
@@ -258,7 +255,6 @@ impl<'a> WatchEventStream<'a> {
                             Either::Right({
                                 let unmatched_move_to = unmatched_move_to.clone();
                                 let unmatched_move_from = unmatched_move_from.clone();
-
                                 {
                                     let mut events = vec![];
                                     {
