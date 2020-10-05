@@ -120,11 +120,8 @@ impl<'a> WatchEventStream<'a> {
                                                 unmatched_move_to.lock().await;
                                             if let Some(idx) =
                                                 unmatched_move_to.iter().position(|(_, event)| {
-                                                    if let WatchEvent::MovedTo {
-                                                        wd: _,
-                                                        name: _,
-                                                        cookie,
-                                                    } = event
+                                                    if let WatchEvent::MovedTo { cookie, .. } =
+                                                        event
                                                     {
                                                         *cookie == raw_event.cookie
                                                     } else {
@@ -134,14 +131,8 @@ impl<'a> WatchEventStream<'a> {
                                             {
                                                 // If we have seen the corresponding MOVED_TO remove it
                                                 // from the unmatched vec and return a Move
-                                                if let (
-                                                    _,
-                                                    WatchEvent::MovedTo {
-                                                        wd,
-                                                        name,
-                                                        cookie: _,
-                                                    },
-                                                ) = unmatched_move_to.swap_remove(idx)
+                                                if let (_, WatchEvent::MovedTo { wd, name, .. }) =
+                                                    unmatched_move_to.swap_remove(idx)
                                                 {
                                                     Some(WatchEvent::Move {
                                                         from_wd: raw_event.wd.clone(),
@@ -171,9 +162,7 @@ impl<'a> WatchEventStream<'a> {
                                             if let Some(idx) =
                                                 unmatched_move_from.iter().position(|(_, event)| {
                                                     if let WatchEvent::MovedFrom {
-                                                        wd: _,
-                                                        name: _,
-                                                        cookie,
+                                                        cookie, ..
                                                     } = event
                                                     {
                                                         *cookie == raw_event.cookie
@@ -184,14 +173,8 @@ impl<'a> WatchEventStream<'a> {
                                             {
                                                 // If we have seen the corresponding MOVED_FROM remove it
                                                 // from the unmatched vec and return a Move
-                                                if let (
-                                                    _,
-                                                    WatchEvent::MovedFrom {
-                                                        wd,
-                                                        name,
-                                                        cookie: _,
-                                                    },
-                                                ) = unmatched_move_from.swap_remove(idx)
+                                                if let (_, WatchEvent::MovedFrom { wd, name, .. }) =
+                                                    unmatched_move_from.swap_remove(idx)
                                                 {
                                                     Some(WatchEvent::Move {
                                                         from_wd: wd,
