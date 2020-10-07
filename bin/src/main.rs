@@ -69,20 +69,20 @@ fn main() {
     executor.init();
 
     let mut fs_tailer_buf = [0u8; 4096];
-    let fs_source = FSSource::new(config.log.dirs, config.log.rules)
-        .process(&mut fs_tailer_buf)
-        .expect("except Failed to create FS Tailer");
-    pin_mut!(fs_source);
-
-    // let sources: &[&mut dyn Stream<Item=Vec<LineBuilder>>] = &[&mut fs_source];
-
-    let mut sources = futures::stream::SelectAll::new();
-    sources.push(&mut fs_source);
+    let mut fs_source = FSSource::new(config.log.dirs, config.log.rules);
     // Create the runtime
     let mut rt = Runtime::new().unwrap();
 
     // Execute the future, blocking the current thread until completion
     rt.block_on(async {
+        let fs_source = fs_source
+            .process(&mut fs_tailer_buf)
+            .expect("except Failed to create FS Tailer");
+        pin_mut!(fs_source);
+
+        let mut sources = futures::stream::SelectAll::new();
+        sources.push(&mut fs_source);
+
         sources
             .for_each(|lines| async {
                 if let Some(lines) = executor.process(lines) {
