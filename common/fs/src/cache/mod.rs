@@ -99,11 +99,11 @@ where
         fs
     }
 
-    pub fn read_events(
+    pub fn stream_events(
         fs: Arc<Mutex<FileSystem<T>>>,
         buf: &'a mut [u8],
     ) -> Result<impl Stream<Item = Event<T>> + 'a, std::io::Error> {
-        //let mut buf = [0u8; 4096];
+
         let events_stream = {
             match fs
                 .try_lock()
@@ -119,33 +119,37 @@ where
             }
         };
 
-        // TODO prepend these onto event stream?
-        // let mut acc = Vec::new();
-        // if !self.initial_events.is_empty() {
-        //     for event in std::mem::replace(&mut self.initial_events, Vec::new()) {
-        //         acc.push(event)
-        //     }
-        // }
+        let initial_events = {
+            let mut fs = fs.try_lock().expect("could not lock watcher");
 
-        Ok(events_stream
-            .into_stream()
-            .map(move |event| {
-                let fs = fs.clone();
-                {
-                    let mut acc = Vec::new();
-
-                    match event {
-                        Ok(event) => {
-                            fs.try_lock()
-                                .expect("couldn't lock self")
-                                .process(event, &mut acc);
-                            futures::stream::iter(acc)
-                        }
-                        _ => panic!("What's the deal if inotify errors?"),
-                    }
+            let mut acc = Vec::new();
+            if !fs.initial_events.is_empty() {
+                for event in std::mem::replace(&mut fs.initial_events, Vec::new()) {
+                    acc.push(event)
                 }
-            })
-            .flatten())
+            }
+            acc
+        };
+
+        let events = events_stream.into_stream().map(move |event| {
+            let fs = fs.clone();
+            {
+                let mut acc = Vec::new();
+
+                match event {
+                    Ok(event) => {
+                        fs.try_lock()
+                            .expect("couldn't lock self")
+                            .process(event, &mut acc);
+                        futures::stream::iter(acc)
+                    }
+                    _ => panic!("Inotify error"),
+                }
+            }
+        });
+
+        Ok(futures::stream::iter(initial_events)
+            .chain(events.flatten()))
     }
 
     // handles inotify events and may produce Event(s) that are return upstream through sender
@@ -906,7 +910,7 @@ mod tests {
 
             tokio_test::block_on(async {
                 futures::StreamExt::collect::<Vec<_>>(futures::StreamExt::take(
-                    FileSystem::read_events($x.clone(), &mut buf)
+                    FileSystem::stream_events($x.clone(), &mut buf)
                         .expect("failed to read events")
                         .timeout(std::time::Duration::from_millis(500)),
                     $y,

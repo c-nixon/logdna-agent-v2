@@ -30,7 +30,7 @@ impl Tailer {
     ) -> Result<impl Stream<Item = Vec<LineBuilder>> + 'a, std::io::Error> {
         // let mut buf = [0u8; 4096];
         let events = {
-            match FileSystem::read_events(self.fs_cache.clone(), buf) {
+            match FileSystem::stream_events(self.fs_cache.clone(), buf) {
                 Ok(event) => event,
                 Err(e) => {
                     warn!("tailer stream raised exception: {:?}", e);

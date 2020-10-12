@@ -227,6 +227,7 @@ impl<'a> WatchEventStream<'a> {
                                 let unmatched_move_to = unmatched_move_to.clone();
                                 let unmatched_move_from = unmatched_move_from.clone();
                                 {
+                                    // TODO: hoist this buffer out into an argument
                                     let mut events = vec![];
                                     {
                                         let mut unmatched_move_to = unmatched_move_to
