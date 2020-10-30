@@ -1,4 +1,5 @@
 use chrono::{Local, TimeZone};
+use futures::channel::oneshot;
 use futures::stream::Stream as FutureStream;
 use http::types::body::LineBuilder;
 use log::warn;
@@ -37,13 +38,13 @@ enum RecordStatus {
 
 struct SharedState {
     waker: Option<Waker>,
-    is_alive: bool,
 }
 
 pub struct Stream {
     thread: Option<JoinHandle<()>>,
     receiver: Option<Receiver<LineBuilder>>,
     shared_state: Arc<Mutex<SharedState>>,
+    thread_stop_chan: Option<oneshot::Sender<()>>,
     path: Path,
 }
 
@@ -52,22 +53,20 @@ impl Stream {
         let mut stream = Self {
             thread: None,
             receiver: None,
-            shared_state: Arc::new(Mutex::new(SharedState {
-                waker: None,
-                is_alive: true,
-            })),
+            shared_state: Arc::new(Mutex::new(SharedState { waker: None })),
+            thread_stop_chan: None,
             path,
         };
-
         stream.spawn_thread();
         stream
     }
 
     fn spawn_thread(&mut self) {
         self.drop_thread();
+        let (stop_sender, mut stop_receiver) = oneshot::channel();
+        self.thread_stop_chan = Some(stop_sender);
 
         let (sender, receiver) = sync_channel(100);
-        self.shared_state.lock().unwrap().is_alive = true;
         let thread_shared_state = self.shared_state.clone();
         let path = self.path.clone();
         let thread = thread::spawn(move || {
@@ -90,22 +89,8 @@ impl Stream {
                 }
             };
 
-            loop {
-                let is_alive = match thread_shared_state.lock() {
-                    Ok(shared_state) => shared_state.is_alive,
-                    Err(e) => {
-                        // we can't wake up the stream so it will hang indefinitely; need
-                        // to panic here
-                        panic!(
-                            "journald's worker thread unable to access shared state: {:?}",
-                            e
-                        );
-                    }
-                };
-
-                if !is_alive {
-                    break;
-                } else if let RecordStatus::Line(line) = journal.process_next_record() {
+            while let Ok(None) = stop_receiver.try_recv() {
+                if let RecordStatus::Line(line) = journal.process_next_record() {
                     if let Err(e) = sender.send(line) {
                         warn!(
                             "journald's worker thread unable to communicate with main thread: {}",
@@ -135,7 +120,11 @@ impl Stream {
     }
 
     fn drop_thread(&mut self) {
-        self.shared_state.lock().unwrap().is_alive = false;
+        self.thread_stop_chan
+            .take()
+            .expect("thread stop chan is missing")
+            .send(())
+            .unwrap_or_else(|_| warn!("Journald Thread receiver already closed, did it panic?"));
         if let Some(thread) = self.thread.take() {
             if let Err(e) = thread.join() {
                 warn!("unable to join journald's worker thread: {:?}", e)
