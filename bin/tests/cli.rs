@@ -612,7 +612,7 @@ fn lookback_none_lines_are_delivered() {
 
     let mut handle = common::spawn_agent(AgentSettings {
         log_dirs: &dir_path,
-        exclusion_regex: Some(r"/var\w*"),
+        exclusion_regex: Some(r"^/var.*"),
         ssl_cert_file: Some(cert_file.path()),
         host: Some(&addr),
         ..Default::default()
