@@ -625,7 +625,7 @@ fn lookback_none_lines_are_delivered() {
     tokio_test::block_on(async {
         let (line_count, _, server) = tokio::join!(
             async {
-                tokio::time::delay_for(tokio::time::Duration::from_millis(5000)).await;
+                tokio::time::delay_for(tokio::time::Duration::from_millis(6000)).await;
 
                 let mut output = String::new();
 
