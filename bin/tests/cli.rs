@@ -535,15 +535,6 @@ fn lookback_start_lines_are_delivered() {
         .for_each(|_| writeln!(file, "{}", log_lines).expect("Couldn't write to temp log file..."));
     file.sync_all().expect("Failed to sync file");
 
-    let mut handle = common::spawn_agent(AgentSettings {
-        log_dirs: &dir_path,
-        exclusion_regex: Some(r"/var\w*"),
-        ssl_cert_file: Some(cert_file.path()),
-        lookback: Some("start"),
-        host: Some(&addr),
-        ..Default::default()
-    });
-
     // Dump the agent's stdout
     // TODO: assert that it's successfully uploaded
 
@@ -552,7 +543,18 @@ fn lookback_start_lines_are_delivered() {
     tokio_test::block_on(async {
         let (line_count, _, server) = tokio::join!(
             async {
+                tokio::time::delay_for(tokio::time::Duration::from_millis(200)).await;
+                let mut handle = common::spawn_agent(AgentSettings {
+                    log_dirs: &dir_path,
+                    exclusion_regex: Some(r"/var\w*"),
+                    ssl_cert_file: Some(cert_file.path()),
+                    lookback: Some("start"),
+                    host: Some(&addr),
+                    ..Default::default()
+                });
+
                 tokio::time::delay_for(tokio::time::Duration::from_millis(5000)).await;
+
                 let mut output = String::new();
 
                 handle.kill().unwrap();
@@ -561,6 +563,7 @@ fn lookback_start_lines_are_delivered() {
                 stderr_ref.read_to_string(&mut output).unwrap();
 
                 debug!("{}", output);
+                debug!("getting lines from {}", file_path.to_str().unwrap());
                 let line_count = received
                     .lock()
                     .await
@@ -602,28 +605,38 @@ fn lookback_none_lines_are_delivered() {
     let file_path = dir.path().join("test.log");
     let mut file = File::create(&file_path).expect("Couldn't create temp log file...");
 
+    debug!("test log: {}", file_path.to_str().unwrap());
     // Enough bytes to get past the lookback threshold
     let line_write_count = (8192 / (log_lines.as_bytes().len() + 1)) + 1;
     (0..line_write_count)
         .for_each(|_| writeln!(file, "{}", log_lines).expect("Couldn't write to temp log file..."));
-    file.sync_all().expect("Failed to sync file");
 
-    let mut handle = common::spawn_agent(AgentSettings {
-        log_dirs: &dir_path,
-        exclusion_regex: Some(r"^/var.*"),
-        ssl_cert_file: Some(cert_file.path()),
-        host: Some(&addr),
-        ..Default::default()
-    });
+    debug!(
+        "wrote {} lines to {} with size {}",
+        line_write_count,
+        file_path.to_str().unwrap(),
+        (log_lines.as_bytes().len() + 1) * line_write_count
+    );
+    file.sync_all().expect("Failed to sync file");
 
     // Dump the agent's stdout
     // TODO: assert that it's successfully uploaded
 
-    thread::sleep(std::time::Duration::from_secs(1));
     tokio_test::block_on(async {
         let (line_count, _, server) = tokio::join!(
             async {
-                tokio::time::delay_for(tokio::time::Duration::from_millis(6000)).await;
+                tokio::time::delay_for(tokio::time::Duration::from_millis(100)).await;
+                let mut handle = common::spawn_agent(AgentSettings {
+                    log_dirs: &dir_path,
+                    exclusion_regex: Some(r"^/var.*"),
+                    ssl_cert_file: Some(cert_file.path()),
+                    lookback: Some("none"),
+                    host: Some(&addr),
+                    ..Default::default()
+                });
+                debug!("spawned agent");
+
+                tokio::time::delay_for(tokio::time::Duration::from_millis(3000)).await;
 
                 let mut output = String::new();
 
@@ -633,6 +646,7 @@ fn lookback_none_lines_are_delivered() {
                 stderr_ref.read_to_string(&mut output).unwrap();
 
                 debug!("{}", output);
+                debug!("getting lines from {}", file_path.to_str().unwrap());
                 handle.wait().unwrap();
                 let line_count = received
                     .lock()
@@ -644,14 +658,13 @@ fn lookback_none_lines_are_delivered() {
                 line_count
             },
             async move {
-                tokio::time::delay_for(tokio::time::Duration::from_millis(500)).await;
+                tokio::time::delay_for(tokio::time::Duration::from_millis(2000)).await;
                 (0..5).for_each(|_| {
                     writeln!(file, "{}", log_lines).expect("Couldn't write to temp log file...");
                     file.sync_all().expect("Failed to sync file");
                 });
-                tokio::time::delay_for(tokio::time::Duration::from_millis(500)).await;
-                // Hack to drive stream forward
                 file.sync_all().expect("Failed to sync file");
+                debug!("wrote 5 lines");
             },
             server
         );
