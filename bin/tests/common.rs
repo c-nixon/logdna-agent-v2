@@ -297,6 +297,7 @@ pub fn self_signed_https_ingester() -> (
         .expect("Couldn't write cert file");
 
     let (server, received, shutdown_handle) = https_ingester(addr, certs, key[0].clone());
+    debug!("Started https ingester on port {}", port);
     (
         server,
         received,
