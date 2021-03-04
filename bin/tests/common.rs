@@ -123,6 +123,7 @@ impl<'a> AgentSettings<'a> {
     pub fn new(log_dirs: &'a str) -> Self {
         AgentSettings {
             log_dirs,
+            exclusion_regex: Some(r"/var\w*"),
             use_ssl: true,
             ..Default::default()
         }

@@ -121,11 +121,7 @@ fn api_key_present() {
 #[cfg_attr(not(feature = "integration_tests"), ignore)]
 fn test_read_file_appended_in_the_background() {
     let dir = tempdir().expect("Could not create temp dir").into_path();
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let context = common::start_append_to_file(&dir, 5);
 
@@ -159,11 +155,7 @@ fn test_append_and_delete() {
     let file_path = dir.join("file1.log");
     File::create(&file_path).expect("Could not create file");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let mut stderr_reader = BufReader::new(agent_handle.stderr.take().unwrap());
 
@@ -187,11 +179,7 @@ fn test_append_and_delete() {
 fn test_file_added_after_initialization() {
     let dir = tempdir().expect("Could not create temp dir").into_path();
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let mut reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
@@ -215,11 +203,7 @@ fn test_delete_does_not_leave_file_descriptor() {
     let file_path = dir.join("file1.log");
     File::create(&file_path).expect("Could not create file");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let process_id = agent_handle.id();
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
@@ -257,11 +241,7 @@ fn test_append_and_move() {
     let file2_path = dir.join("file2.log");
     File::create(&file1_path).expect("Could not create file");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
     common::wait_for_file_event("initialized", &file1_path, &mut stderr_reader);
@@ -288,11 +268,7 @@ fn test_truncate_file() {
     let file_path = dir.join("file1.log");
     common::append_to_file(&file_path, 100, 50).expect("Could not append");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
@@ -371,11 +347,7 @@ fn test_files_other_than_dot_log_should_be_not_included_by_default() {
         common::append_to_file(&dir.join(file_name), 100, 50).expect("Could not append");
     }
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&dir.to_str().unwrap()));
 
     let mut reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
     let lines = common::wait_for_file_event("initialized", &included_file, &mut reader);
@@ -412,11 +384,7 @@ fn test_dangling_symlinks() {
     let symlink_path = log_dir.join("file1.log");
     common::append_to_file(&file_path, 100, 50).expect("Could not append");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &log_dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&log_dir.to_str().unwrap()));
 
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
@@ -447,11 +415,7 @@ fn test_append_after_symlinks_delete() {
     let symlink_path = log_dir.join("file1.log");
     common::append_to_file(&file_path, 100, 50).expect("Could not append");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &log_dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&log_dir.to_str().unwrap()));
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
     std::os::unix::fs::symlink(&file_path, &symlink_path).unwrap();
@@ -493,11 +457,7 @@ fn test_directory_symlinks_delete() {
     common::append_to_file(&file2_path, 100, 50).expect("Could not append");
     common::append_to_file(&file3_path, 100, 50).expect("Could not append");
 
-    let mut agent_handle = common::spawn_agent(AgentSettings {
-        exclusion_regex: Some(r"/var\w*"),
-        log_dirs: &log_dir.to_str().unwrap(),
-        ..Default::default()
-    });
+    let mut agent_handle = common::spawn_agent(AgentSettings::new(&log_dir.to_str().unwrap()));
 
     let mut stderr_reader = BufReader::new(agent_handle.stderr.as_mut().unwrap());
 
